@@ -84,3 +84,26 @@
 - **Decision needed:** Run watching and workers with the API or as a separate
   indexer process.
 - **Tentative choice:** A separate indexer process sharing internal Go packages.
+
+## D-012: Use ParadeDB pg_search for full-text search
+
+- **Status:** Accepted
+- **Choice:** Base the deployed PostgreSQL image on ParadeDB's distribution and
+  index extracted document text with `pg_search` BM25 indexes. Pair the Lindera
+  Japanese tokenizer with an ngram-tokenized field for recall, and apply NFKC
+  normalization (full/half width, kana variants) to extracted text at ingestion.
+- **Rationale:** Stays inside PostgreSQL per D-002, so indexing remains
+  transactional with River jobs and filesystem state, while providing true BM25
+  relevance ranking plus snippets, highlighting, and facets. Queries remain
+  plain SQL, compatible with sqlc.
+- **Rejected:**
+  - PGroonga: the most mature Japanese tokenization and normalization, but its
+    default scoring is term-frequency based; relevance ranking was prioritized.
+  - pg_bigm and native `tsvector`: no relevance ranking, and no maintained
+    Japanese segmentation respectively.
+  - Elasticsearch/OpenSearch: best-in-class Japanese analysis (kuromoji/Sudachi)
+    but a second stateful store — dual-write consistency, reindex tooling, and
+    JVM operational burden are disproportionate at this system's scale.
+- **Follow-up:** Validate Japanese query quality early with real Tika-extracted
+  documents (width and kana variants, compound nouns, short 1–2 character
+  terms). PGroonga is the designated fallback if quality disappoints.

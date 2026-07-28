@@ -22,6 +22,9 @@ implementation yet.
   choices, and delivery rules in
   `.apm/instructions/base.local.instructions.md`.
 - Drafted the initial implementation plan and recorded unresolved decisions.
+- Selected ParadeDB `pg_search` for full-text search (D-012), rejecting
+  PGroonga, pg_bigm, and Elasticsearch; Japanese query-quality validation with
+  real documents is a recorded follow-up.
 
 ## In progress
 

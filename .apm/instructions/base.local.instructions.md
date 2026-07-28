@@ -46,6 +46,11 @@ decision explicitly requires it.
 - Use Go for most application and service code.
 - PostgreSQL is the mandatory system database and full-text search backend. Its
   deployment is part of this repository.
+- Provide full-text search with [ParadeDB](https://www.paradedb.com/)
+  `pg_search` BM25 indexes; the deployed PostgreSQL image is ParadeDB-based.
+  Japanese content is the primary search target: NFKC-normalize extracted text
+  at ingestion and index it with the Lindera Japanese tokenizer paired with an
+  ngram field for recall.
 - Keep SQL explicit and use [`sqlc`](https://sqlc.dev/) to generate type-safe Go
   code from queries. Do not introduce an ORM around generated query code.
 - Use [River](https://riverqueue.com/) with PostgreSQL for durable task queuing,

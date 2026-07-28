@@ -46,7 +46,10 @@ full-text search, and rendering system described by the repository instructions.
 
 Use a Go-first service architecture backed by PostgreSQL. Keep explicit SQL and
 generate Go bindings with sqlc. Use River for durable extraction, indexing,
-invalidation, and scheduled maintenance. Define the browser-facing contract in
+invalidation, and scheduled maintenance. Provide full-text search with ParadeDB
+`pg_search` BM25 indexes — a Lindera Japanese-tokenized field paired with an
+ngram field for recall, over NFKC-normalized extracted text — so the deployed
+PostgreSQL image is ParadeDB-based (D-012). Define the browser-facing contract in
 protobuf and generate ConnectRPC bindings for Go and TypeScript. Keep the search
 API and Preact GUI in this repository while retaining `go-overwatch` and
 `gahaku` as independently versioned sub-repositories.
@@ -57,6 +60,9 @@ Rejected alternatives:
   contract lifecycle and benefit from atomic changes.
 - An ORM or non-PostgreSQL queue: these conflict with the selected sqlc and River
   stack.
+- PGroonga, pg_bigm, or an external search engine (Elasticsearch/OpenSearch):
+  see D-012 — BM25 ranking inside PostgreSQL was chosen over more mature
+  Japanese tokenization or a second stateful store.
 - Direct browser access to database or object storage internals: all
   system-facing behavior belongs behind the generated API.
 
@@ -74,8 +80,9 @@ Rejected alternatives:
    - Install River's required PostgreSQL schema.
 3. Implement ingestion and lifecycle processing.
    - Connect go-overwatch events to idempotent River jobs.
-   - Implement Tika extraction, database updates, PostgreSQL full-text indexing,
-     retries, and stale-thumbnail invalidation.
+   - Implement Tika extraction, NFKC text normalization, database updates,
+     ParadeDB BM25 indexing (Lindera Japanese plus ngram fields), retries, and
+     stale-thumbnail invalidation.
    - Implement the agreed delete, rename, and move semantics.
 4. Implement the ConnectRPC API.
    - Define search, document detail, render, and thumbnail operations in
@@ -91,8 +98,9 @@ Rejected alternatives:
 6. Build deployment composition.
    - Add Quadlet units, networks, volumes, health checks, and configuration
      templates under `deploy/`.
-   - Include PostgreSQL, Tika, VersityGW, application containers, and a pod with
-     schema-migration init containers.
+   - Include PostgreSQL (ParadeDB-based image providing `pg_search`), Tika,
+     VersityGW, application containers, and a pod with schema-migration init
+     containers.
    - Select and document rootless or system/rootful operation.
 7. Verify the system.
    - Add focused package and UI tests.
@@ -108,6 +116,9 @@ Rejected alternatives:
 - Exercise duplicated events and interrupted River jobs to prove idempotency.
 - Verify search results update after modification and disappear or transition as
   specified after deletion.
+- Verify Japanese search quality with real Tika-extracted documents: full/half
+  width and kana variants, compound nouns, and short 1–2 character terms match
+  and rank sensibly (D-012 follow-up; PGroonga is the fallback).
 - Verify stale thumbnails cannot be served after document content changes.
 - Verify theme behavior for light, dark, system default, and persisted override.
 - Run the full Quadlet deployment in a KVM guest from a clean state and after a
@@ -125,6 +136,10 @@ Rejected alternatives:
   to avoid resource exhaustion.
 - Browser access, local-file rendering, and unauthenticated deployment can
   expose sensitive document content.
+- ParadeDB is a young extension: PostgreSQL major upgrades are coupled to its
+  image releases, and its CJK path is less battle-tested than PGroonga's —
+  Japanese recall depends on ingest-time NFKC normalization and the dual
+  Lindera/ngram field setup working as expected.
 
 ## Open questions
 
