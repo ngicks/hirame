@@ -1,0 +1,32 @@
+# The one network every service in this deployment talks over, and the reason
+# PostgreSQL, Tika, Gahaku, and VersityGW need no published ports (D-010):
+# container names resolve on it and nowhere else.
+#
+# Internal=true cuts the network off from anything outside itself: no route out
+# to the internet, no route in from off-host. Image pulls are unaffected — they
+# happen on the host's network before a container joins this one.
+#
+# The single published port belongs to hirame.pod. Under rootless podman that
+# forward is made by rootlessport, from inside the rootless network namespace to
+# the pod's address, so it never crosses the boundary Internal=true closes; the
+# bridge still gets a gateway address (`podman network inspect` shows one even
+# with --internal). Under a *rootful* install — the D-009 escalation in
+# deploy/README.md, and what the podman-in-podman harness will run — the same
+# forward is host DNAT, which netavark's internal rules may drop.
+#
+# So: if the GUI's port does not answer and everything else is healthy, this
+# line is the first suspect. Either drop Internal=true — the isolation D-010
+# actually asks for is that internal services publish no ports, which every
+# other unit already satisfies on its own — or add a second, non-internal
+# network that only hirame.pod joins and leave the backends here.
+#
+# A [Unit] section is mandatory even carrying nothing but a description: the
+# generator emits a [Unit] in the generated .service only when the source unit
+# has one, and the Requires=/After= edges it derives live there.
+
+[Unit]
+Description=Internal podman network of the hirame deployment
+
+[Network]
+NetworkName=hirame
+Internal=true

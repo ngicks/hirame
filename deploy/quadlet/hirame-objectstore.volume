@@ -1,0 +1,18 @@
+# VersityGW's posix backend: each subdirectory is a bucket, each file below one
+# an object, so this volume is the whole thumbnail store.
+#
+# It holds only thumbnails (D-008) and every one of them can be re-rendered from
+# the source document, which makes it a cache rather than a system of record —
+# it does not need backing up, and losing it costs render time, not data. It
+# must still survive a restart: the cache accounting that decides what to evict
+# lives in PostgreSQL and would otherwise describe objects that are gone.
+#
+# The posix backend keeps bucket and object metadata in user.* extended
+# attributes; a filesystem that drops them surfaces as metadata errors from
+# ordinary S3 calls that mention nothing about xattrs.
+
+[Unit]
+Description=Backing store of the hirame thumbnail object storage
+
+[Volume]
+VolumeName=hirame-objectstore

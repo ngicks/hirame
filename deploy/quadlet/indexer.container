@@ -1,0 +1,48 @@
+# Filesystem watching and the River worker pool, in their own process so
+# extraction load cannot reach API latency (D-011).
+
+[Unit]
+Description=hirame indexer and River workers
+
+# The migration gate (D-005), same shape as search-api.container: Requires=
+# pulls it in, After= is what makes a failed migration stop this unit.
+Requires=hirame-migrate.service
+After=hirame-migrate.service
+
+# The pipeline's dependencies. Wants= rather than Requires= because River
+# retries: a job that cannot reach Tika or the renderer fails and is retried,
+# which is a better failure than a worker pool that refuses to start and leaves
+# the queue unattended.
+Wants=tika.service gahaku.service versitygw-bootstrap.service overwatch.service
+After=tika.service gahaku.service versitygw-bootstrap.service overwatch.service
+
+[Container]
+Image=localhost/hirame-search-api:latest
+Pod=hirame.pod
+
+EnvironmentFile=%h/.config/hirame/hirame.env
+EnvironmentFile=%h/.config/hirame/secrets.env
+
+# The documents, read-only (D-009). The same host path overwatch.container
+# mounts, at the same container path — WATCH_MOUNTPOINTS names it, and the
+# paths overwatch reports are resolved here.
+Volume=%h/hirame/documents:/srv/documents:ro
+
+# The overwatch socket. The daemon chmods it 0660 and it is owned by the user
+# the daemon runs as, which is root in its container; group 0 below is what
+# lets this unprivileged process connect without also being uid 0.
+Volume=hirame-overwatch-run.volume:/run/overwatch/hirame
+
+# uid 10001 is the image's `hirame` user; the gid override is the socket
+# access described above and nothing else. The process writes nothing that
+# group 0 ownership would matter for.
+User=10001:0
+
+Exec=indexer
+
+[Service]
+Restart=always
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target

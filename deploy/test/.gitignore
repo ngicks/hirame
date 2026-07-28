@@ -1,0 +1,7 @@
+# Compiled from lib/*.c by lib/pnp-enter on first use.
+/lib/userns-exec
+/lib/pnp-mount
+
+# `go build` in fakeoverwatch/ leaves the binary beside its source, and
+# build-images.sh copies that directory into an image build context.
+/fakeoverwatch/fakeoverwatch

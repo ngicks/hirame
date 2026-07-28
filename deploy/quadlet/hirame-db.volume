@@ -1,0 +1,15 @@
+# PostgreSQL's data directory, and with it the search index, the River job
+# queue, the filesystem observations, and the thumbnail-cache accounting — the
+# only volume in this deployment whose loss is not recoverable by reprocessing.
+# Mounted at /var/lib/postgresql, the path the ParadeDB image declares as its
+# volume; PGDATA is /var/lib/postgresql/18/docker underneath it.
+#
+# Owned by uid 999 (the image's `postgres` user) as seen inside the container's
+# user namespace. Back it up with pg_dump or pg_basebackup against the running
+# server, not by copying the directory. See deploy/README.md.
+
+[Unit]
+Description=PostgreSQL data directory of the hirame deployment
+
+[Volume]
+VolumeName=hirame-db

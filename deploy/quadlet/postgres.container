@@ -1,0 +1,68 @@
+# The system database, the full-text index, and the River queue in one server
+# (D-002). Not an optional external dependency: nothing else in this deployment
+# starts before it is accepting connections.
+
+[Unit]
+Description=PostgreSQL (ParadeDB) for the hirame deployment
+
+[Container]
+# Pinned to the exact pair the schema was verified against: pg_search 0.24.3 on
+# PostgreSQL 18.4 (migration 0002_search_index.sql). ParadeDB couples its
+# releases to a PostgreSQL major, so a floating tag can move both at once.
+Image=docker.io/paradedb/paradedb:0.24.3-pg18
+
+# Also the host every other unit resolves on hirame.network; DATABASE_URL in
+# secrets.env names it. Without it the container would be `systemd-postgres`.
+ContainerName=postgres
+Network=hirame.network
+
+# The image declares /var/lib/postgresql as its volume and puts PGDATA at
+# /var/lib/postgresql/18/docker underneath, so mounting the parent captures the
+# data directory and the version layout the image expects to find it under.
+Volume=hirame-db.volume:/var/lib/postgresql
+
+# Read-only: the file is deployment configuration, not state the server edits.
+Volume=%h/.config/hirame/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+
+# POSTGRES_DB / POSTGRES_USER / POSTGRES_PASSWORD. No `-` prefix: a database
+# that came up with the image's defaults would be a worse outcome than a unit
+# that refuses to start.
+EnvironmentFile=%h/.config/hirame/secrets.env
+
+# ParadeDB's bootstrap appends a hardware-derived tuning block to
+# PGDATA/postgresql.conf at first init, which deploy/config/postgresql.conf
+# includes rather than replaces. Set PDB_TUNE=false to size the server by hand.
+Environment=PDB_TUNE=true
+
+# --host forces TCP. The default would use the unix socket, which the image's
+# entrypoint also serves from during initialisation with a temporary
+# listen_addresses='' server — a socket check would report ready against that
+# one and let migrations run against a server about to be shut down.
+HealthCmd=pg_isready --host=127.0.0.1 --port=5432 --username=hirame --dbname=hirame --quiet
+HealthInterval=5s
+HealthTimeout=3s
+HealthRetries=12
+HealthStartPeriod=10s
+
+# This is the readiness edge the whole deployment hangs off, and the reason it
+# diverges from gahaku's versitygw.container, which deliberately omits it: with
+# --sdnotify=healthy the unit is not "started" until pg_isready passes, so the
+# After= in migrations/hirame-migrate.container orders against a database that
+# actually accepts connections rather than against a container that exists.
+Notify=healthy
+
+# Passed to the image's entrypoint, which recognises `postgres` as the server
+# command and initialises the cluster first if PGDATA is empty. data_directory
+# is not set in the file — the server falls back to the image's PGDATA.
+Exec=postgres -c config_file=/etc/postgresql/postgresql.conf
+
+[Service]
+Restart=always
+
+# First start pulls a multi-gigabyte image and runs initdb plus ParadeDB's
+# extension bootstrap. systemd's 90s default would leave that as a failed unit
+# rather than a slow one.
+TimeoutStartSec=600
+
+[Install]
+WantedBy=default.target

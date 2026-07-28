@@ -1,0 +1,35 @@
+{
+  "name": "@hirame/web-gui",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@ark-ui/react": "^5.37.2",
+    "@bufbuild/protobuf": "^2.13.0",
+    "@connectrpc/connect": "^2.1.2",
+    "@connectrpc/connect-web": "^2.1.2",
+    "@preact/signals": "^2.10.0",
+    "@tanstack/preact-query": "^5.101.4",
+    "preact": "^10.29.7",
+    "preact-iso": "^2.12.1"
+  },
+  "devDependencies": {
+    "@preact/preset-vite": "^2.10.6",
+    "@tailwindcss/vite": "^4.3.3",
+    "@testing-library/preact": "^3.2.4",
+    "@types/node": "^24.0.0",
+    "daisyui": "^5.7.4",
+    "jsdom": "^30.0.0",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^7.0.2",
+    "vite": "^8.1.5",
+    "vitest": "^4.1.10"
+  }
+}

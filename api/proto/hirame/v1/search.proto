@@ -1,0 +1,71 @@
+syntax = "proto3";
+
+package hirame.v1;
+
+import "hirame/v1/document.proto";
+
+option go_package = "github.com/ngicks/hirame/apps/search-api/internal/gen/hirame/v1;hiramev1";
+
+// SearchService queries the BM25 index over extracted document text (D-012).
+service SearchService {
+  rpc Search(SearchRequest) returns (SearchResponse) {}
+}
+
+message SearchRequest {
+  // Free-form user query. It is NFKC-normalized server-side to match the
+  // normalization applied to indexed text, so callers pass it through as typed.
+  string query = 1;
+  // Hits per page. 0 selects the server default; values above the server
+  // maximum are clamped rather than rejected.
+  uint32 page_size = 2;
+  // Opaque cursor from a previous SearchResponse.next_page_token. Empty
+  // requests the first page. The token encodes the query too, so pairing it
+  // with a different query fails with INVALID_ARGUMENT rather than returning
+  // results from the wrong query.
+  string page_token = 3;
+  // Maximum snippets per hit. 0 selects the server default, and the server
+  // may still return fewer when the match is concentrated in one place.
+  uint32 max_snippets = 4;
+}
+
+message SearchResponse {
+  repeated SearchHit hits = 1;
+  // Empty on the last page.
+  string next_page_token = 2;
+  // Total matching documents. An estimate: it is computed against the index
+  // at query time and tombstoned documents are filtered out afterwards.
+  uint64 estimated_total_hits = 3;
+}
+
+// SearchHit is one matching document at the content version that matched.
+message SearchHit {
+  // Carries the content version whose extracted text produced this hit, so a
+  // client can request a render straight from a result without a second
+  // round trip and without risking a version mismatch.
+  DocumentRef ref = 1;
+  string file_name = 2;
+  string relative_path = 3;
+  string media_type = 4;
+  // BM25 score. Comparable only within one response; it is not a percentage
+  // and not stable across queries or index rebuilds.
+  double score = 5;
+  repeated Snippet snippets = 6;
+}
+
+// Snippet is one excerpt of extracted text around a match.
+message Snippet {
+  // Excerpt split at highlight boundaries, in reading order. Concatenating
+  // every segment's text reproduces the excerpt.
+  //
+  // Segments rather than offset ranges: the server counts UTF-8 bytes and the
+  // browser counts UTF-16 code units, so any offset would have to be
+  // translated on one side and would silently corrupt Japanese text if it
+  // were not.
+  repeated SnippetSegment segments = 1;
+}
+
+message SnippetSegment {
+  string text = 1;
+  // True when this segment matched the query and should be emphasized.
+  bool highlighted = 2;
+}

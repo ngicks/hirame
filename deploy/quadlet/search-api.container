@@ -1,0 +1,67 @@
+# The ConnectRPC API. Its only client is the Caddy proxy sharing this pod's
+# network namespace (D-010), which is why it binds loopback.
+
+[Unit]
+Description=hirame ConnectRPC search API
+
+# The migration gate (D-005). Requires= alone would only pull the unit in; the
+# After= is what makes a failed migration stop this unit from starting. See
+# migrations/hirame-migrate.container.
+Requires=hirame-migrate.service
+After=hirame-migrate.service
+
+# Render and thumbnail RPCs need both, and neither is covered by the migration
+# chain. Wants= rather than Requires=: a request that reaches an absent renderer
+# fails as one RPC, whereas refusing to serve search because a thumbnail bucket
+# is missing would be the worse outcome.
+Wants=gahaku.service versitygw-bootstrap.service
+After=gahaku.service versitygw-bootstrap.service
+
+[Container]
+# Built from apps/search-api, published nowhere:
+#
+#	podman build --tag hirame-search-api:latest \
+#	             --file apps/search-api/Containerfile .
+#
+# The context is the repository root: the module replaces both sub-repositories
+# with their checkouts. See apps/search-api/Containerfile.
+Image=localhost/hirame-search-api:latest
+Pod=hirame.pod
+
+EnvironmentFile=%h/.config/hirame/hirame.env
+EnvironmentFile=%h/.config/hirame/secrets.env
+
+# The documents, read-only (D-009) — the same host path and container path
+# indexer.container and overwatch.container mount, because documents.path is
+# stored absolute and resolved here unchanged.
+#
+# The API reads them because renders stream to Gahaku as a byte stream: Gahaku
+# holds no mount of its own, and pointing it at a local_path instead would mean
+# mounting the documents into the renderer too and allowlisting a root there.
+# Without this the render and thumbnail RPCs fail on every document while search
+# keeps working, which is a confusing way to be broken.
+Volume=%h/hirame/documents:/srv/documents:ro
+
+# server.HealthPath, deliberately outside server.APIPrefix so readiness does
+# not depend on the RPC stack. The address is LISTEN_ADDR from hirame.env;
+# changing one means changing the other and the Caddyfile.
+HealthCmd=wget --quiet --output-document=/dev/null http://127.0.0.1:8081/healthz
+HealthInterval=10s
+HealthTimeout=3s
+HealthRetries=3
+HealthStartPeriod=5s
+
+# web-gui.container orders after this unit, and with --sdnotify=healthy that
+# ordering means the proxy does not start until /healthz answers.
+Notify=healthy
+
+# The image's CMD, named explicitly because the same image carries three
+# binaries.
+Exec=search-api
+
+[Service]
+Restart=always
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target

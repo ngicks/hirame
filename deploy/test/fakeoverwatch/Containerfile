@@ -1,0 +1,32 @@
+# The stand-in overwatch daemon of deploy/test/. Only run-e2e.sh builds it, and
+# only in an environment where the real daemon cannot start.
+#
+# The context is not this directory: go.mod replaces the go-overwatch module
+# with the submodule checkout (the module proxy cannot serve it — see the
+# comment there), so the build needs both trees under one root at the same
+# relative depth the replace names. build-images.sh assembles that context.
+#
+#	deploy/test/build-images.sh          # or, by hand:
+#	podman build --isolation=chroot \
+#	  -f deploy/test/fakeoverwatch/Containerfile -t hirame-fake-overwatch:latest <ctx>
+
+FROM docker.io/library/golang:1.26-bookworm AS build
+
+WORKDIR /src/deploy/test/fakeoverwatch
+
+COPY go-overwatch/overwatch /src/go-overwatch/overwatch
+COPY deploy/test/fakeoverwatch/go.mod deploy/test/fakeoverwatch/go.sum ./
+RUN go mod download
+
+COPY deploy/test/fakeoverwatch/main.go ./
+
+RUN CGO_ENABLED=0 go build -trimpath -ldflags '-s -w' -o /out/overwatch .
+
+FROM docker.io/library/debian:bookworm-slim
+
+# Installed as `overwatch`, at the path the real image uses: overwatch.container
+# names the binary in both Exec= and HealthCmd=, and this image has to satisfy
+# both without the unit knowing which image it got.
+COPY --from=build /out/overwatch /usr/local/bin/overwatch
+
+ENTRYPOINT ["overwatch"]

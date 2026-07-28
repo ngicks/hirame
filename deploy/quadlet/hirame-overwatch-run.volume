@@ -1,0 +1,16 @@
+# The overwatch daemon's per-instance runtime directory, shared so the indexer
+# can dial the unix socket the daemon creates in it. Runtime state only: the
+# daemon is stateless by design and removes the socket on exit, so this volume
+# holds nothing worth backing up and nothing worth preserving across a restart.
+#
+# A named volume rather than a bind mount because both ends are containers of
+# the same rootless stack; a host directory would additionally have to be
+# writable by the mapped uid. The daemon's MkdirAll leaves an existing directory
+# alone, so the mode is podman's, and the socket it then creates is 0660 owned
+# by the daemon's user — which is why indexer.container runs with group 0.
+
+[Unit]
+Description=Runtime directory holding the overwatch gRPC socket
+
+[Volume]
+VolumeName=hirame-overwatch-run

@@ -1,0 +1,6 @@
+# The build stage copies cmd/ and internal/ explicitly; everything else in the
+# module is either build input the Containerfile names itself or noise that
+# would invalidate the context hash on every edit.
+Containerfile
+.containerignore
+sqlc.yaml

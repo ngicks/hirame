@@ -1,0 +1,14 @@
+version: "2"
+sql:
+  # The migrations are the schema: there is no second schema.sql to drift from
+  # them. sqlc's PostgreSQL parser accepts the pg_search DDL and the pdb.*
+  # casts/operators as written, so no stub catalog is needed.
+  - engine: "postgresql"
+    schema: "internal/store/migrations"
+    queries: "internal/store/queries"
+    gen:
+      go:
+        package: "sqlcgen"
+        out: "internal/store/sqlcgen"
+        sql_package: "pgx/v5"
+        emit_pointers_for_null_types: true

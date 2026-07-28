@@ -1,0 +1,70 @@
+syntax = "proto3";
+
+package hirame.v1;
+
+import "hirame/v1/document.proto";
+
+option go_package = "github.com/ngicks/hirame/apps/search-api/internal/gen/hirame/v1;hiramev1";
+
+// RenderService produces full-size page images on demand.
+//
+// Renders are streamed straight through from Gahaku and never cached (D-008):
+// full-size output is large, request volume is low, and a cache would need the
+// same invalidation machinery thumbnails already have.
+service RenderService {
+  rpc RenderPage(RenderPageRequest) returns (stream RenderPageResponse) {}
+}
+
+message RenderPageRequest {
+  // Both halves are required. A ref whose content_version_id is no longer the
+  // document's current version fails with FAILED_PRECONDITION; the client is
+  // expected to re-read the document and retry against the new version.
+  // An unknown document_id fails with NOT_FOUND.
+  DocumentRef ref = 1;
+  // 1-based page of the document. 0 is rejected; a value above the content
+  // version's page_count fails with OUT_OF_RANGE.
+  uint32 page_number = 2;
+  ImageFormat format = 3;
+  // Bounds the render, preserving aspect ratio. Unset or zero on an axis
+  // leaves that axis unbounded. Pages are never scaled up.
+  ImageSize max_size = 4;
+}
+
+// RenderPageResponse is one frame of a render stream: exactly one info
+// message, then the image bytes in order.
+message RenderPageResponse {
+  oneof payload {
+    RenderPageInfo info = 1;
+    bytes chunk = 2;
+  }
+}
+
+// RenderPageInfo opens a render stream. It is sent before the first chunk,
+// which lets a client size a viewport before any bytes arrive.
+message RenderPageInfo {
+  // Echoes the requested ref. A client that kept a request in flight across a
+  // navigation can drop a response belonging to a different document version
+  // instead of painting it.
+  DocumentRef ref = 1;
+  uint32 page_number = 2;
+  ImageFormat format = 3;
+  ImageSize size = 4;
+  // 0 when the renderer streams without knowing the encoded length up front.
+  uint64 total_bytes = 5;
+}
+
+message ImageSize {
+  uint32 width = 1;
+  uint32 height = 2;
+}
+
+// ImageFormat is the encoding of a rendered image. It is deliberately a subset
+// of what Gahaku can emit: only formats a browser displays natively.
+enum ImageFormat {
+  // Selects the server default.
+  IMAGE_FORMAT_UNSPECIFIED = 0;
+  IMAGE_FORMAT_PNG = 1;
+  IMAGE_FORMAT_JPEG = 2;
+  IMAGE_FORMAT_WEBP = 3;
+  IMAGE_FORMAT_AVIF = 4;
+}

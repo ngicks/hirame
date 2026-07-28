@@ -1,0 +1,52 @@
+syntax = "proto3";
+
+package hirame.v1;
+
+import "hirame/v1/document.proto";
+import "hirame/v1/render.proto";
+
+option go_package = "github.com/ngicks/hirame/apps/search-api/internal/gen/hirame/v1;hiramev1";
+
+// ThumbnailService serves small page previews, rendered on first request and
+// cached in object storage (D-008).
+//
+// The response carries bytes rather than a presigned object-storage URL: the
+// gateway holding the cache has no published ports (D-010), so such a URL
+// would not be reachable from a browser.
+service ThumbnailService {
+  rpc GetThumbnail(GetThumbnailRequest) returns (GetThumbnailResponse) {}
+}
+
+// GetThumbnailRequest fully determines a cache entry: ref plus spec is the
+// cache key, so the same request always names the same stored object and a
+// content change can never resolve to an object rendered from older bytes.
+message GetThumbnailRequest {
+  // As with RenderPageRequest, a superseded content_version_id fails with
+  // FAILED_PRECONDITION rather than being upgraded to the current version.
+  // This is what makes a stale thumbnail unservable: the cached object stays
+  // addressable only by a ref no live document produces any more, and the
+  // eviction job removes it.
+  DocumentRef ref = 1;
+  // 1-based. 0 is rejected; use 1 for the cover thumbnail of a page-based
+  // document.
+  uint32 page_number = 2;
+  ThumbnailSpec spec = 3;
+}
+
+// ThumbnailSpec is the render shape half of the cache key.
+message ThumbnailSpec {
+  // Bounds the thumbnail, preserving aspect ratio. Unset selects the server's
+  // configured default size. Servers may quantize arbitrary sizes to a small
+  // set of allowed ones so the cache does not fragment across callers.
+  ImageSize max_size = 1;
+  ImageFormat format = 2;
+}
+
+message GetThumbnailResponse {
+  // Echoes the requested ref, for the same reason RenderPageInfo does.
+  DocumentRef ref = 1;
+  uint32 page_number = 2;
+  ImageFormat format = 3;
+  ImageSize size = 4;
+  bytes image = 5;
+}

@@ -1,0 +1,39 @@
+# Creates the thumbnail bucket, once, before anything writes to it.
+#
+# Through the S3 API rather than by making a directory in the volume: the posix
+# backend recognises a bucket by the user.* extended attributes CreateBucket
+# writes, so a bare mkdir produces a directory that ordinary S3 calls then fail
+# on with metadata errors. versitygw itself has no "create this bucket at
+# startup" option — `versitygw admin` manages users, not buckets — so the
+# bootstrap is a client.
+#
+# mc rather than aws-cli: `mb --ignore-existing` is idempotent, which is what a
+# unit that reruns on every boot needs, and the MC_HOST_gw alias in secrets.env
+# means the whole thing is one command with no shell and no config file.
+
+[Unit]
+Description=Create the hirame thumbnail bucket in versitygw
+Requires=versitygw.service
+After=versitygw.service
+
+[Container]
+Image=docker.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+Network=hirame.network
+
+# MC_HOST_gw=http://<key>:<secret>@versitygw:7070
+EnvironmentFile=%h/.config/hirame/secrets.env
+
+# The image's entrypoint is `mc`, so this is its argument list. Must agree with
+# S3_BUCKET in hirame.env.
+Exec=mb --ignore-existing gw/hirame-thumbnails
+
+[Service]
+# Not a service: it runs to completion and its exit code is the result. Without
+# RemainAfterExit the unit would fall back to inactive the moment it succeeded,
+# and every Requires= on it would restart the bucket check.
+Type=oneshot
+RemainAfterExit=yes
+
+# No [Install]: it is reached only through the Requires= of the units that
+# actually need the bucket, so enabling it on its own would create a bucket for
+# a deployment that is not running.

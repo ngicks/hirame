@@ -1,0 +1,60 @@
+# The schema-migration init container of hirame.pod (D-005). It applies every
+# pending migration and exits; nothing that reads or writes the schema starts
+# until it has exited 0.
+#
+# How that is actually enforced, since "the init container ran first" is not by
+# itself a guarantee:
+#
+#   * Type=oneshot means systemd holds the job in "activating" until the
+#     `podman run` in the generated ExecStart returns, and that run is in the
+#     foreground — the generator emits no -d for a oneshot — so the container's
+#     exit status is the unit's. A failed migration is a failed unit.
+#   * search-api.container and indexer.container carry Requires= plus After= on
+#     this unit. systemd's rule for that pair is explicit: if a Requires=
+#     dependency fails to activate and an After= orders against it, the
+#     dependent unit is not started at all. Requires= without After= would only
+#     pull it in, concurrently, which is the mistake this comment exists to
+#     prevent.
+#   * RemainAfterExit=yes keeps the successful run "active", so the Requires=
+#     of the dependents is satisfied rather than re-triggering a migration per
+#     dependent. The cost: `systemctl --user restart search-api` alone will not
+#     re-run migrations after a redeploy. Restart this unit first — see
+#     deploy/README.md.
+#   * Requires=/After= on postgres.service, whose Notify=healthy makes "started"
+#     mean "pg_isready passes". Ordering against a container that merely exists
+#     would race initdb on a first boot.
+#
+# Verify the shape after any edit with the quadlet dry-run generator: the
+# generated [Service] must keep Type=oneshot and its ExecStart must not carry -d.
+
+[Unit]
+Description=Apply hirame database schema migrations
+Requires=postgres.service
+After=postgres.service
+
+[Container]
+# The same image as search-api and the indexer, so the migrations applied and
+# the code that reads the resulting schema can never be different builds.
+Image=localhost/hirame-search-api:latest
+Pod=hirame.pod
+
+# DATABASE_URL. hirame.env is loaded too so a single documented environment
+# describes all three binaries; migrate ignores everything but Database.
+EnvironmentFile=%h/.config/hirame/hirame.env
+EnvironmentFile=%h/.config/hirame/secrets.env
+
+# No arguments: the zero Options applies pending migrations. `migrate -status`
+# and `migrate -dry-run` are the read-only forms an operator runs by hand.
+Exec=migrate
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# Long enough for the first run, which creates the River schema and builds the
+# BM25 index definitions on an empty database, and short enough that a
+# migration blocked on a lock does not hang the boot forever.
+TimeoutStartSec=600
+
+# No [Install]: it is reached through the Requires= of the applications, which
+# is the only ordering in which running it means anything.

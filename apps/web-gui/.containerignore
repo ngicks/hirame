@@ -1,0 +1,7 @@
+# node_modules and dist are the host's build products. Leaving them in the
+# context would ship a tree built against the host's platform into an image
+# that reinstalls and rebuilds anyway, and would dominate the context transfer.
+node_modules
+dist
+Containerfile
+.containerignore

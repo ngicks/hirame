@@ -1,0 +1,32 @@
+# The application tier: the migration init container, the indexer, the API, and
+# the GUI proxy in one network namespace.
+#
+# A pod rather than four containers on the network because AGENTS.md asks for
+# migrations to run as init containers of the pod their applications live in,
+# and because it is what makes the API's same-origin arrangement real (D-010):
+# search-api binds 127.0.0.1:8081, Caddy reaches it over loopback, and the only
+# thing that leaves the namespace is the published port below.
+#
+# The infrastructure services stay outside it. They are addressed by name on
+# hirame.network, which the pod joins, and each has a lifecycle — and a
+# healthcheck — of its own; folding them in would collapse four independent
+# readiness edges into one namespace with no ordering benefit.
+#
+# Quadlet does not implement podman's --init-ctr, so the "init container" is a
+# Type=oneshot member ordered ahead of the rest; migrations/ documents the
+# mechanics.
+
+[Unit]
+Description=hirame application pod
+
+[Pod]
+PodName=hirame
+Network=hirame.network
+
+# The deployment's only published port (D-010). Caddy holds 8080 inside the
+# namespace. Narrow this to 127.0.0.1:8080:8080 when a reverse proxy on the
+# host terminates TLS in front of it.
+PublishPort=8080:8080
+
+[Install]
+WantedBy=default.target

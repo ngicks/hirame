@@ -1,0 +1,50 @@
+# The S3-compatible store holding the thumbnail cache (D-008). search-api and
+# the indexer address it directly and also presign urls against it for Gahaku
+# to fetch and upload through.
+#
+# Follows gahaku/deployment/quadlet/versitygw.container, with two deliberate
+# differences: no PublishPort, because nothing off the internal network may
+# reach it (D-010), and Notify=healthy, because versitygw-bootstrap.service has
+# to create a bucket against a gateway that is actually answering.
+
+[Unit]
+Description=versitygw S3 gateway holding the hirame thumbnail cache
+
+[Container]
+# Pinned rather than :latest so a restart cannot swap the gateway underneath a
+# running deployment. v1.7.0 is what gahaku's own deployment tests ran against.
+Image=docker.io/versity/versitygw:v1.7.0
+
+# Also the host presigned urls are signed for. gahaku fetches them from inside
+# hirame.network, where the gateway answers as `versitygw`; a url signed for
+# any other host reaches nothing.
+ContainerName=versitygw
+Network=hirame.network
+
+Volume=hirame-objectstore.volume:/data
+
+# ROOT_ACCESS_KEY_ID / ROOT_SECRET_ACCESS_KEY.
+EnvironmentFile=%h/.config/hirame/secrets.env
+
+# Off by default; the path is served on the S3 port as a plain unauthenticated
+# GET, which is what makes it usable from HealthCmd below.
+Environment=VGW_HEALTH=/health
+
+# wget is busybox's, present in the image.
+HealthCmd=wget --quiet --output-document=/dev/null http://127.0.0.1:7070/health
+HealthInterval=10s
+HealthTimeout=3s
+HealthRetries=3
+HealthStartPeriod=5s
+Notify=healthy
+
+# Positional, not a flag: the posix backend takes its top-level directory as an
+# argument, and the image's entrypoint execs whatever the container is given.
+Exec=posix /data
+
+[Service]
+Restart=always
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target

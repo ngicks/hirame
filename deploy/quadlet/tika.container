@@ -1,0 +1,39 @@
+# Document text and metadata extraction. The indexer posts document bytes here
+# and stores what comes back (D-012's NFKC normalisation happens on the Go side,
+# not in Tika).
+
+[Unit]
+Description=Apache Tika extraction server
+
+[Container]
+# The -full variant, not the plain one: it carries the OCR and image toolchain
+# (tesseract, gdal) that scanned PDFs need, which is most of what a document
+# archive contains. Pinned because a Tika minor can change how a format parses,
+# and every extraction it produced before is already indexed.
+Image=docker.io/apache/tika:3.3.1.0-full
+
+ContainerName=tika
+Network=hirame.network
+
+# wget is present in the image (it is Ubuntu-based and runs as uid 35002).
+# /tika answers with the server banner on a plain GET and needs no request body,
+# which makes it the cheapest endpoint that proves the server parsed its config
+# and bound the port.
+HealthCmd=wget --quiet --output-document=/dev/null http://127.0.0.1:9998/tika
+HealthInterval=15s
+HealthTimeout=5s
+HealthRetries=4
+# The JVM plus the -full image's parser registry takes tens of seconds before
+# the port answers; without this the first checks fail and count as retries.
+HealthStartPeriod=60s
+
+# The indexer's own TIKA_TIMEOUT bounds a single extraction, so an unhealthy
+# Tika surfaces as failing River jobs that retry, not as a failed unit.
+Notify=healthy
+
+[Service]
+Restart=always
+TimeoutStartSec=600
+
+[Install]
+WantedBy=default.target

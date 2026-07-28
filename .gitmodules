@@ -1,0 +1,6 @@
+[submodule "go-overwatch"]
+	path = go-overwatch
+	url = https://github.com/ngicks/go-overwatch
+[submodule "gahaku"]
+	path = gahaku
+	url = https://github.com/ngicks/gahaku

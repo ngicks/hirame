@@ -1,0 +1,45 @@
+# The deployment's only published surface (D-010): the SPA and the ConnectRPC
+# API share this origin, which is what lets src/api/transport.ts use a relative
+# baseUrl in production and vite.config.ts reproduce it in development.
+
+{
+	# No ACME: the unit publishes a plain HTTP port and any TLS belongs to a
+	# reverse proxy in front of the deployment, which is where a real hostname
+	# and certificate live.
+	auto_https off
+
+	# Nothing in this deployment drives Caddy's API, and the admin endpoint
+	# would otherwise listen inside the pod netns alongside the API.
+	admin off
+}
+
+:8080 {
+	# Caddy applies its own directive order, so this runs ahead of the handle
+	# blocks below whatever the file order is. Connect's own framing is
+	# uncompressed, so it benefits here too.
+	encode zstd gzip
+
+	# `handle`, never `handle_path`: search-api mounts every generated service
+	# under /api itself (server.APIPrefix, and NewHandler's StripPrefix), so a
+	# proxy that also stripped the prefix would turn every RPC into a 404.
+	handle /api/* {
+		# search-api binds 127.0.0.1:8081 in this same pod netns. flush_interval
+		# -1 disables response buffering, without which a Connect server-stream
+		# would arrive only after the handler finished.
+		reverse_proxy 127.0.0.1:8081 {
+			flush_interval -1
+		}
+	}
+
+	handle {
+		root * /srv
+		# The SPA routes client-side (preact-iso), so any unmatched path has to
+		# resolve to the document shell rather than a 404.
+		try_files {path} /index.html
+		file_server
+	}
+
+	log {
+		output stderr
+	}
+}

@@ -1,0 +1,13 @@
+{
+  "instance": "hirame",
+  "listen": {
+    "unix": "/run/overwatch/hirame/hirame.sock"
+  },
+  "watch": [
+    { "root": "/srv/documents" }
+  ],
+  "events": ["create", "modify", "delete", "move", "close_write"],
+  "limits": {
+    "syscalls_per_sec": 200
+  }
+}

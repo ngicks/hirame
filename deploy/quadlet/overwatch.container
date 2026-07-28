@@ -1,0 +1,63 @@
+# The fanotify watcher whose event stream starts the whole pipeline. It
+# publishes a gRPC unix socket into hirame-overwatch-run.volume, which
+# indexer.container mounts; no TCP listener is configured, so the daemon has no
+# presence on hirame.network at all.
+#
+# READ THIS BEFORE INSTALLING ROOTLESS. fanotify filesystem marks require
+# CAP_SYS_ADMIN in the *initial* user namespace. AddCapability= below grants it
+# inside the container's namespace, which is enough under a system (rootful)
+# podman and is not enough under a rootless one — the daemon then refuses to
+# start with a clear error rather than degrading. This is the one unit in the
+# deployment that D-009's "escalate only if a real mountpoint demands it"
+# clause applies to; deploy/README.md gives the two supported ways out.
+
+[Unit]
+Description=overwatch filesystem watcher for the hirame deployment
+Documentation=https://github.com/ngicks/go-overwatch
+
+[Container]
+# Built from the submodule, which is pre-release and publishes no image:
+#
+#	podman build -f deploy/overwatch/Containerfile \
+#	             --tag hirame-overwatch:latest go-overwatch
+Image=localhost/hirame-overwatch:latest
+
+ContainerName=overwatch
+
+# No Network=: the daemon speaks only over the unix socket below. Joining
+# hirame.network would give it an address nothing dials.
+Network=none
+
+# The watched tree, read-only (D-009). Change the host side to the real
+# mountpoint; the container side is fixed by deploy/config/overwatch.json and
+# by WATCH_MOUNTPOINTS in hirame.env, which have to name the same path because
+# the indexer resolves the paths the daemon reports in its own namespace.
+Volume=%h/hirame/documents:/srv/documents:ro
+
+# The daemon creates /run/overwatch/hirame/ and binds hirame.sock in it.
+Volume=hirame-overwatch-run.volume:/run/overwatch/hirame
+
+Volume=%h/.config/hirame/overwatch.json:/etc/overwatch/config.json:ro
+
+# Namespace-local under rootless podman; see the header.
+AddCapability=CAP_SYS_ADMIN
+
+# The daemon's own client, over the socket it just bound: the only check that
+# distinguishes "the process is up" from "the gRPC service is answering". It
+# matters because the daemon does not implement sd_notify, so without this the
+# unit would be ready the moment the process forked.
+HealthCmd=overwatch client --socket /run/overwatch/hirame/hirame.sock status
+HealthInterval=15s
+HealthTimeout=5s
+HealthRetries=3
+HealthStartPeriod=10s
+Notify=healthy
+
+Exec=server serve --config /etc/overwatch/config.json
+
+[Service]
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=default.target

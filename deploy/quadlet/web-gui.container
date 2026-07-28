@@ -1,0 +1,37 @@
+# The Preact bundle and the reverse proxy in front of the API — the only thing
+# in this deployment a browser talks to (D-010). The port it answers on is
+# published by hirame.pod, not here: a pod member cannot publish its own.
+
+[Unit]
+Description=hirame web GUI and API reverse proxy
+
+# Ordered after the API so the first page load cannot land on a proxy whose
+# upstream is not listening. search-api.container's Notify=healthy makes this
+# ordering wait for /healthz rather than for a container to exist. Requires=,
+# because a GUI that cannot reach the API has nothing to show.
+Requires=search-api.service
+After=search-api.service
+
+[Container]
+# Built from apps/web-gui, published nowhere:
+#
+#	podman build --tag hirame-web-gui:latest apps/web-gui
+Image=localhost/hirame-web-gui:latest
+Pod=hirame.pod
+
+# busybox wget, from the caddy:alpine base. It fetches the SPA shell, which is
+# the static handler rather than the proxied one — an upstream that is down is
+# search-api's health to report, not this unit's.
+HealthCmd=wget --quiet --output-document=/dev/null http://127.0.0.1:8080/
+HealthInterval=15s
+HealthTimeout=3s
+HealthRetries=3
+HealthStartPeriod=5s
+Notify=healthy
+
+[Service]
+Restart=always
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,56 @@
+# The render service (D-008): thumbnails and full-size views, produced on
+# demand over gRPC. Follows gahaku/deployment/quadlet/gahaku.container, less
+# its PublishPort — nothing outside hirame.network may reach it (D-010).
+#
+# Deliberately not ordered after versitygw.service: gahaku holds no storage
+# credentials and never contacts the gateway until a request hands it a
+# presigned url, so a gateway that is still starting costs nothing here.
+
+[Unit]
+Description=gahaku document rendering gRPC service
+
+[Container]
+# Published nowhere. Build it from the submodule's own Dockerfile:
+#
+#	podman build --tag gahaku:latest gahaku
+#
+# The localhost/ prefix keeps a missing build a loud "image not known" rather
+# than a pull attempt against docker.io.
+Image=localhost/gahaku:latest
+
+# The host GAHAKU_URL in hirame.env names, and the authority of the gRPC target
+# search-api and the indexer dial.
+ContainerName=gahaku
+Network=hirame.network
+
+# Configured through the environment rather than Exec= arguments: the binary
+# layers defaults < file < environment < flags, and Environment= lines are what
+# a systemd drop-in can override without rewriting the unit.
+Environment=GAHAKU_LISTEN=:9000
+
+# Both of these relax an input guard the binary turns on by default, and both
+# have to come off for a gateway that speaks plain http on a podman network:
+# GAHAKU_INPUT_BLOCK_PRIVATE_ADDRESSES refuses exactly the RFC1918 addresses
+# hirame.network hands out, and GAHAKU_INPUT_ALLOW_HTTP the plain-http scheme
+# versitygw serves. The cost is that gahaku will fetch and upload to any url a
+# caller names — acceptable only because the only callers are search-api and
+# the indexer, which sign every url themselves.
+Environment=GAHAKU_INPUT_ALLOW_HTTP=true
+Environment=GAHAKU_INPUT_BLOCK_PRIVATE_ADDRESSES=false
+
+# Has to outlive the slowest render: it is the deadline a worker subprocess is
+# killed on, and office conversions pay soffice's startup. Kept at or under the
+# GAHAKU_TIMEOUT the callers use, so the caller's deadline is the outer one.
+Environment=GAHAKU_WORKER_TIMEOUT=2m
+
+# Bounds concurrent soffice subprocesses. RENDER_CONCURRENCY in hirame.env is
+# counted per calling process, and both search-api and the indexer render, so
+# this is the limit that actually caps the machine.
+Environment=GAHAKU_WORKER_CONCURRENCY=4
+
+[Service]
+Restart=always
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target

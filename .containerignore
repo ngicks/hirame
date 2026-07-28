@@ -1,0 +1,15 @@
+# Applies to builds whose context is the repository root, which is
+# apps/search-api/Containerfile only: its go.mod replaces both sub-repositories
+# with their checkouts, so the context has to span them.
+#
+# Everything listed here is either a host build product or history no image
+# stage reads, and together they are most of what the context would otherwise
+# transfer.
+# `**/` on every one: podman matches a pattern against the context-relative
+# path segment by segment, so a bare `node_modules` excludes only a
+# root-level entry and would leave apps/web-gui/node_modules (200 MB+) and
+# both submodule .git directories in the context.
+**/node_modules
+**/dist
+**/.git
+**/apm_modules

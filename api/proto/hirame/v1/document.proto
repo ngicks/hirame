@@ -1,0 +1,97 @@
+syntax = "proto3";
+
+package hirame.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/ngicks/hirame/apps/search-api/internal/gen/hirame/v1;hiramev1";
+
+// DocumentService resolves what a document currently is.
+//
+// It is the only place in this API where "the current content of a document"
+// is resolved. Every other service addresses content through a DocumentRef
+// the client obtained from here or from SearchService, so a render request
+// can never silently follow a document that changed underneath it.
+service DocumentService {
+  rpc GetDocument(GetDocumentRequest) returns (GetDocumentResponse) {}
+}
+
+// GetDocumentRequest asks for a document by its stable identity.
+//
+// No content version is supplied: this call exists to learn the current one.
+message GetDocumentRequest {
+  string document_id = 1;
+}
+
+message GetDocumentResponse {
+  Document document = 1;
+}
+
+// DocumentRef addresses a document at one exact content version.
+//
+// Both halves are required wherever a render is produced. The pair is what
+// makes a stale render unservable: a ref naming a superseded version is
+// rejected rather than transparently upgraded, because upgrading it would
+// return an image the client never asked for and cannot detect as different.
+message DocumentRef {
+  // Opaque, stable across renames and moves of the underlying file (D-007).
+  string document_id = 1;
+  // Opaque, derived from a content hash. A new value means the bytes changed,
+  // so every asset derived from the old value is invalid.
+  string content_version_id = 2;
+}
+
+// Document is the metadata a detail view renders.
+message Document {
+  string document_id = 1;
+  // Identifies the watched mountpoint the document was discovered under.
+  string mountpoint_id = 2;
+  // Slash-separated path relative to the mountpoint root. Presentation only:
+  // it changes when the file moves, so it must not be used as identity.
+  string relative_path = 3;
+  string file_name = 4;
+  // Content version currently on disk. Unset while the document is a
+  // tombstone (D-007): the row survives deletion so render-cache accounting
+  // and invalidation history stay consistent, but there is nothing to render.
+  ContentVersion current_version = 5;
+  // True once the source file is gone. Tombstoned documents are excluded from
+  // search results and cannot be rendered.
+  bool deleted = 6;
+  google.protobuf.Timestamp discovered_time = 7;
+  // Last time the source file's content was observed to change.
+  google.protobuf.Timestamp modified_time = 8;
+}
+
+// ContentVersion describes one immutable snapshot of a document's bytes.
+message ContentVersion {
+  string content_version_id = 1;
+  // IANA media type as detected during extraction. Empty when detection failed.
+  string media_type = 2;
+  uint64 size_bytes = 3;
+  // Renderable pages. 0 when the page count is not known yet or the media type
+  // has no meaningful page structure.
+  uint32 page_count = 4;
+  ExtractionState extraction_state = 5;
+  // True only when extracted text is stored and searchable for this version.
+  // A client must not infer this from extraction_state alone: an extraction
+  // can succeed on a document that holds no text at all.
+  bool has_extracted_text = 6;
+  // First time these exact bytes were seen anywhere under the watched
+  // mountpoints. An unchanged file that moved keeps its original value.
+  google.protobuf.Timestamp first_seen_time = 7;
+  // Set only when extraction_state is EXTRACTION_STATE_FAILED.
+  string extraction_error = 8;
+}
+
+// ExtractionState is how far text extraction has progressed for a content
+// version.
+enum ExtractionState {
+  EXTRACTION_STATE_UNSPECIFIED = 0;
+  // Recorded, extraction job not finished.
+  EXTRACTION_STATE_PENDING = 1;
+  EXTRACTION_STATE_SUCCEEDED = 2;
+  // Extraction ran and errored; retriable, see ContentVersion.extraction_error.
+  EXTRACTION_STATE_FAILED = 3;
+  // The media type is not one this system extracts. Terminal, not retried.
+  EXTRACTION_STATE_UNSUPPORTED = 4;
+}

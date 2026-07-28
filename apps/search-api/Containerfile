@@ -1,0 +1,68 @@
+# One image, three binaries (D-011): search-api, indexer, and migrate share the
+# schema, the job types, and internal/config, so shipping them separately would
+# mean three images that must never drift. The Quadlet units pick a binary with
+# `Exec=`; CMD below is only the default for a bare `podman run`.
+#
+# THE CONTEXT IS THE REPOSITORY ROOT, not this directory:
+#
+#	podman build --tag hirame-search-api:latest --file apps/search-api/Containerfile .
+#
+# go.mod replaces github.com/ngicks/go-overwatch/overwatch and
+# github.com/ngicks/gahaku with the submodule checkouts, which is what makes the
+# revisions D-006 pins in this repository's index the ones that get built — and
+# in go-overwatch's case the only option at all, since its module zip carries a
+# path component Windows reserves and sum.golang.org answers 404 for it. Both
+# replace targets are ../../ from this module, so a context of apps/search-api
+# alone cannot resolve either and `go mod download` fails on the first one.
+
+FROM docker.io/library/golang:1.26-bookworm AS build
+
+WORKDIR /src/apps/search-api
+
+# The module graph first, so a source-only change reuses the download layer.
+# That includes the two replaced modules: `go mod download` reads their go.mod
+# even though it downloads nothing for them.
+COPY go-overwatch/overwatch/go.mod go-overwatch/overwatch/go.sum /src/go-overwatch/overwatch/
+COPY gahaku/go.mod gahaku/go.sum /src/gahaku/
+COPY apps/search-api/go.mod apps/search-api/go.sum ./
+RUN go mod download
+
+COPY go-overwatch/overwatch /src/go-overwatch/overwatch
+COPY gahaku /src/gahaku
+
+COPY apps/search-api/cmd ./cmd
+COPY apps/search-api/internal ./internal
+
+# CGO_ENABLED=0 leaves binaries with no dynamic dependency on the build image's
+# libc, so the runtime stage carries nothing but the healthcheck client and CA
+# bundle. `-o /out/` with ./cmd/... names each output after its command
+# directory: /out/{search-api,indexer,migrate}.
+RUN CGO_ENABLED=0 go build -trimpath -ldflags '-s -w' -o /out/ ./cmd/...
+
+FROM docker.io/library/debian:bookworm-slim
+
+# wget is what search-api.container's HealthCmd runs; a scratch or distroless
+# base would leave the unit with no way to probe /healthz from inside the
+# container. ca-certificates is for https S3 endpoints — the in-pod VersityGW
+# speaks plain http, but a deployment that fronts it with TLS needs this.
+RUN apt-get update \
+	&& apt-get install --yes --no-install-recommends \
+		ca-certificates \
+		wget \
+	&& rm -rf /var/lib/apt/lists/*
+
+# A fixed uid rather than a name-allocated one: indexer.container runs as
+# 10001:0 so it can reach the overwatch socket through group 0, and that
+# override has to name a uid that exists here.
+RUN groupadd --gid 10001 hirame \
+	&& useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin hirame
+
+COPY --from=build /out/ /usr/local/bin/
+
+USER hirame
+
+# config.Server.ListenAddr's default. The deployment overrides it to
+# 127.0.0.1:8081 because the API shares a pod netns with the GUI proxy (D-010).
+EXPOSE 8080
+
+CMD ["search-api"]

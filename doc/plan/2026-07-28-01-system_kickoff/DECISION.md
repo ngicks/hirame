@@ -46,44 +46,76 @@
 
 ## D-006: Sub-repository attachment mechanism
 
-- **Status:** Open
-- **Decision needed:** Git submodules or externally managed nested Git
-  checkouts.
-- **Tentative choice:** Git submodules.
+- **Status:** Accepted
+- **Choice:** Attach `go-overwatch/` and `gahaku/` as Git submodules.
+- **Rationale:** Submodules pin exact revisions in the parent index, keeping the
+  workspace reproducible without flattening sub-repository history.
+- **Rejected:** Externally managed nested checkouts (revisions would not be
+  recorded in this repository).
 
 ## D-007: Filesystem removal and identity semantics
 
-- **Status:** Open
-- **Decision needed:** Deletion, rename, move, tombstone, and identity behavior.
-- **Tentative choice:** Tombstone deletions and preserve identity for detectable
-  renames or moves.
+- **Status:** Accepted
+- **Choice:** Tombstone deleted documents (retain the row, mark deleted, drop
+  from search results). Preserve document identity across detectable renames and
+  moves; content identity is tracked by content hash so an unchanged file moved
+  elsewhere keeps its extraction and render lineage.
+- **Rationale:** Tombstones keep render/cache accounting and audit history
+  consistent while search reflects only live files.
+- **Rejected:** Hard row deletion (loses invalidation lineage) and path-only
+  identity (breaks on rename).
 
 ## D-008: Render-cache scope and limits
 
-- **Status:** Open
-- **Decision needed:** Stored render types and the meaning of the size cap.
-- **Tentative choice:** Cache thumbnails only, bounded by a cache-wide byte quota
-  and per-object maximum age.
+- **Status:** Accepted
+- **Choice:** VersityGW stores thumbnails only; full-size renders are produced
+  on demand and streamed without caching. The cache is bounded by a cache-wide
+  byte quota and a per-object maximum age, enforced by a scheduled River
+  maintenance job using database-side accounting.
+- **Rationale:** Thumbnails dominate request volume; database accounting makes
+  eviction deterministic where VersityGW has no native policy.
+- **Rejected:** Caching full renders (unbounded size for marginal benefit).
 
 ## D-009: Quadlet privilege mode
 
-- **Status:** Open
-- **Decision needed:** Rootless or system/rootful services.
-- **Tentative choice:** Rootless unless watched-mount access requires otherwise.
+- **Status:** Accepted
+- **Choice:** Rootless Quadlet under a dedicated service user, with the watched
+  mountpoint bind-mounted read-only into the indexer container. Escalate to
+  system units only if a real mountpoint's permissions demand it.
+- **Rationale:** Rootless is the safer default and sufficient when the service
+  user is granted read access to watched paths.
+- **Rejected:** Rootful-by-default operation.
+- **Amendment (2026-07-28):** go-overwatch's fanotify filesystem marks require
+  `CAP_SYS_ADMIN` in the initial user namespace, which no rootless container can
+  provide. The escalation clause applies to the watcher alone: run the overwatch
+  daemon as a system-level unit (rootful container or host daemon per
+  go-overwatch's systemd ops doc) and share its Unix socket with the otherwise
+  rootless stack via a bind mount. In nested/e2e environments without fanotify,
+  ingestion falls back to the indexer's Scan reconciliation path.
 
 ## D-010: Authentication and network exposure
 
-- **Status:** Open
-- **Decision needed:** User authentication and externally reachable services.
-- **Tentative choice:** Expose the GUI and same-origin ConnectRPC endpoint only;
-  keep supporting services private.
+- **Status:** Accepted
+- **Choice:** Expose only the web GUI origin; the ConnectRPC API is served
+  same-origin behind the GUI's reverse proxy. PostgreSQL, Tika, Gahaku, and
+  VersityGW live on an internal Podman network with no published ports. No user
+  authentication in this first version; the deployment is for trusted networks
+  and auth is a documented follow-up.
+- **Rationale:** Minimal exposed surface; internal services are unreachable from
+  the browser.
+- **Rejected:** Publishing internal service ports; building auth before the
+  core pipeline exists.
 
 ## D-011: Ingestion process boundary
 
-- **Status:** Open
-- **Decision needed:** Run watching and workers with the API or as a separate
-  indexer process.
-- **Tentative choice:** A separate indexer process sharing internal Go packages.
+- **Status:** Accepted
+- **Choice:** A separate `indexer` binary in `apps/search-api/` (shared Go
+  module, `cmd/indexer` and `cmd/search-api` entrypoints) runs filesystem
+  watching and River workers with independently configurable concurrency.
+- **Rationale:** Shared packages keep schema and job types atomic while process
+  separation isolates crash and resource behavior.
+- **Rejected:** In-API workers (couples API latency to extraction load) and a
+  separate Go module (splits the shared schema code).
 
 ## D-012: Use ParadeDB pg_search for full-text search
 
@@ -107,3 +139,22 @@
 - **Follow-up:** Validate Japanese query quality early with real Tika-extracted
   documents (width and kana variants, compound nouns, short 1–2 character
   terms). PGroonga is the designated fallback if quality disappoints.
+- **Validation result (2026-07-28):** Verified against live pg_search 0.24.3:
+  compound nouns, kana, and half-width→NFKC cases all match and rank sensibly;
+  tombstoned documents stay excluded. One precision cost observed: the ngram
+  field admits low-score false positives (e.g. `アパート` matching `レポート`
+  via the `ート` bigram) and can slightly outrank Lindera's correct
+  segmentation. Mitigation: boost the Lindera field over the ngram field in the
+  search query. PGroonga fallback is not warranted on current evidence.
+
+## D-013: End-to-end testing via podman-in-podman
+
+- **Status:** Accepted (user decision, 2026-07-28)
+- **Choice:** Run deployment end-to-end tests with podman-in-podman: an outer
+  privileged-enough Podman container runs the Quadlet deployment with an inner
+  Podman, instead of a KVM guest VM.
+- **Rationale:** User directive; the execution environment lacks reliable
+  `/dev/kvm`, and podman-in-podman exercises the same Quadlet units with far
+  lighter setup.
+- **Rejected:** `kvm-in-container` KVM guest testing (retained as a future
+  option for kernel-level fidelity, e.g. real systemd boot ordering).

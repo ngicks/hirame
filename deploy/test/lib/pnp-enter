@@ -1,0 +1,64 @@
+#!/bin/sh
+# Run a command inside a user namespace that maps the whole id range
+# 0..65536 identity-wise, plus a private mount namespace.
+#
+# WHY THIS EXISTS AT ALL. On an ordinary host with systemd this harness is not
+# needed: the units in deploy/quadlet/ are installed, `systemctl daemon-reload`
+# generates the services, and everything below is dead weight. It exists for
+# the CI shape D-013 chose — a container that is not privileged enough to run
+# podman directly:
+#
+#   * the surrounding container's user namespace maps a single uid, so crun's
+#     implicit user namespace leaves gid 5 unmapped and its `mount devpts
+#     (gid=5)` fails with EINVAL;
+#   * that namespace holds no CAP_SYS_ADMIN, so no mount is possible at all.
+#
+# Inside the namespace this creates, ids 0..65536 exist and we hold every
+# capability over them, which is exactly what crun and multi-uid images
+# (postgres runs as 999, the search-api image as 10001) need.
+#
+# The id map MUST be two extents. A typical devenv map is
+#
+#	0   1000       1
+#	1 100000   65536
+#
+# and the kernel's map_id_range_down requires each child extent to fall inside
+# a single parent extent, so the obvious "0 0 65537" is rejected with EPERM.
+#
+# NAMESPACES ARE NOT RE-ENTERABLE HERE. There is no nsenter in this image and a
+# second pnp-enter is a *different* user namespace, so everything a run needs
+# has to happen inside one invocation. That is why run-e2e.sh hands the whole
+# end-to-end sequence to a single pnp-enter.
+set -eu
+here=$(cd "$(dirname "$0")" && pwd)
+
+PNP_UIDMAP='0 0 1
+1 1 65536
+'
+PNP_GIDMAP="$PNP_UIDMAP"
+export PNP_UIDMAP PNP_GIDMAP
+export PNP_ROOT="$here"
+export PATH="$here:$PATH"
+
+[ -x "$here/userns-exec" ] || gcc -O2 -o "$here/userns-exec" "$here/userns-exec.c"
+[ -x "$here/pnp-mount" ] || gcc -O2 -o "$here/pnp-mount" "$here/pnp-mount.c"
+
+# Forward leading namespace flags (-C cgroup, -n net, -p pid, -i ipc, -u uts)
+# to userns-exec; -m (mount namespace) is always on, since the private tmpfs
+# mounts are the whole point.
+ns_flags=""
+while [ $# -gt 0 ]; do
+	case "$1" in
+	-C | -n | -p | -i | -u)
+		ns_flags="$ns_flags $1"
+		shift
+		;;
+	--)
+		shift
+		break
+		;;
+	*) break ;;
+	esac
+done
+
+exec "$here/userns-exec" -m $ns_flags -- "$@"

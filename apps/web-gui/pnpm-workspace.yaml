@@ -1,0 +1,2 @@
+minimumReleaseAgeExclude:
+  - jsdom@30.0.0
