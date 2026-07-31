@@ -33,7 +33,7 @@ The protobuf schema is the contract; both the Go server bindings and the
 TypeScript browser client are generated from it and committed.
 
 ```sh
-buf generate     # or: make generate
+buf generate     # or: just generate
 ```
 
 Run it from the repository root — `buf.gen.yaml` writes into two applications,

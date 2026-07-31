@@ -135,6 +135,69 @@ func TestADocumentExactlyAtTheCapIsAccepted(t *testing.T) {
 	}
 }
 
+func newCappedResponseClient(
+	t *testing.T,
+	handler http.HandlerFunc,
+	maxResponseBytes int64,
+) *tika.Client {
+	t.Helper()
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+
+	client, err := tika.New(tika.Config{
+		BaseURL:          srv.URL,
+		Timeout:          5 * time.Second,
+		MaxResponseBytes: maxResponseBytes,
+	})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	return client
+}
+
+// An answer this process cannot hold is a failure, not something to buffer:
+// nothing in the protocol bounds what a server may send back.
+func TestAResponsePastTheCapFailsRatherThanBeingBuffered(t *testing.T) {
+	client := newCappedResponseClient(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		_, _ = w.Write([]byte(strings.Repeat("x", 64)))
+	}, 8)
+
+	_, err := client.Text(t.Context(), strings.NewReader("document"), "")
+	if !errors.Is(err, tika.ErrTooLarge) {
+		t.Fatalf("Text error = %v, want ErrTooLarge", err)
+	}
+}
+
+// ErrTooLarge is what the extraction worker reads as permanent, so an oversize
+// response is recorded once rather than retried until the attempts run out.
+func TestAnOversizeResponseIsPermanent(t *testing.T) {
+	client := newCappedResponseClient(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		_, _ = w.Write([]byte(strings.Repeat("x", 64)))
+	}, 8)
+
+	_, err := client.Meta(t.Context(), strings.NewReader("document"), "")
+	if !errors.Is(err, tika.ErrTooLarge) {
+		t.Fatalf("Meta error = %v, want ErrTooLarge", err)
+	}
+}
+
+func TestAResponseExactlyAtTheCapIsAccepted(t *testing.T) {
+	client := newCappedResponseClient(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		_, _ = w.Write([]byte("12345678"))
+	}, 8)
+
+	text, err := client.Text(t.Context(), strings.NewReader("document"), "")
+	if err != nil {
+		t.Fatalf("Text: %v", err)
+	}
+	if text != "12345678" {
+		t.Errorf("text = %q, want the whole response", text)
+	}
+}
+
 func TestStatusErrorsSeparatePermanentFromRetryable(t *testing.T) {
 	for _, tc := range []struct {
 		name      string

@@ -2,6 +2,7 @@
 /lib/userns-exec
 /lib/pnp-mount
 
-# `go build` in fakeoverwatch/ leaves the binary beside its source, and
-# build-images.sh copies that directory into an image build context.
-/fakeoverwatch/fakeoverwatch
+# The two overwatch binaries build-images.sh compiles: the real daemon, which
+# the harness runs once to record its refusal, and the stand-in it runs
+# instead. Host binaries rather than images since D-009 (deploy/README.md).
+/bin/

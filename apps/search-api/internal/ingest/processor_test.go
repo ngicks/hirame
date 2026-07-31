@@ -2,6 +2,7 @@ package ingest_test
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"io/fs"
 	"testing"
@@ -138,6 +139,133 @@ func TestChangedBytesSupersedeTheVersionAndInvalidateItsThumbnails(t *testing.T)
 	if got.DocumentID != docID || got.SupersededTarget != firstVersion {
 		t.Errorf("invalidation = %+v, want document %d superseding version %d",
 			got, docID, firstVersion)
+	}
+}
+
+// Two ingest jobs for one path legitimately overlap: a burst of writes queues a
+// debounced job and the closing write queues a settled one, and they carry
+// different uniqueness keys on purpose. Both read the document's version, hash
+// outside any transaction, and write later — so the version a job believes it is
+// superseding can already have been superseded by the other. A blind write would
+// name the loser's stale value for invalidation, which drops the thumbnails of
+// the version that is current and keeps the ones that are stale.
+func TestALostRaceInvalidatesTheVersionActuallySuperseded(t *testing.T) {
+	store := newFakeStore()
+	path := testRoot + "/a.pdf"
+	seedObservation(t, store, path, 100)
+
+	files := map[string]string{path: "%PDF-1.4 first"}
+	p := newProcessor(store, files)
+	if err := p.ProcessPath(t.Context(), 1, path); err != nil {
+		t.Fatalf("first process: %v", err)
+	}
+	var docID, firstVersion int64
+	for _, doc := range store.tx.documents {
+		docID, firstVersion = doc.ID, doc.CurrentContentVersionID
+	}
+
+	// The rival job wins: it promotes a version of its own between this job's
+	// read of the document and its write.
+	rivalVersion, err := store.tx.UpsertContentVersion(t.Context(), "rival", 1)
+	if err != nil {
+		t.Fatalf("stage the rival's version: %v", err)
+	}
+	store.tx.onDocumentRead = func() { store.tx.setVersion(docID, rivalVersion) }
+
+	files[path] = "%PDF-1.4 second, quite different"
+	if err := p.ProcessPath(t.Context(), 1, path); err != nil {
+		t.Fatalf("second process: %v", err)
+	}
+
+	if len(store.tx.queuedInvalidate) != 1 {
+		t.Fatalf("invalidations = %v, want one", store.tx.queuedInvalidate)
+	}
+	switch got := store.tx.queuedInvalidate[0].SupersededTarget; got {
+	case rivalVersion:
+	case firstVersion:
+		t.Errorf("invalidation targets version %d, which the rival had already "+
+			"superseded; the rival's %d is the one this write displaced",
+			firstVersion, rivalVersion)
+	default:
+		t.Errorf("invalidation targets version %d, want the rival's %d", got, rivalVersion)
+	}
+}
+
+// hookOpener runs fn as the file is opened, which is the window between the
+// observation read and the write transaction: hashing happens there, outside any
+// transaction, and it is long enough for the whole file.
+type hookOpener struct {
+	fakeOpener
+	fn func()
+}
+
+func (o hookOpener) Open(path string) (io.ReadCloser, error) {
+	rc, err := o.fakeOpener.Open(path)
+	if o.fn != nil {
+		o.fn()
+	}
+	return rc, err
+}
+
+func newRacingProcessor(
+	store *fakeStore,
+	files map[string]string,
+	duringHash func(),
+) *ingest.Processor {
+	return ingest.NewProcessor(
+		store,
+		doctype.NewFilter(nil),
+		hookOpener{fakeOpener: fakeOpener{files: files}, fn: duringHash},
+		discardLogger(),
+	)
+}
+
+// A delete that lands while the hash is running drops the observation and
+// tombstones the document. Neither is visible to the lookups that follow — the
+// tombstone is skipped by the live-path query and the partial unique index
+// permits the insert — so creating from the stale read would mint a live
+// document for a path that no longer exists: no later event names it, its
+// extraction job finds no file, and only a full rescan would ever clear it.
+func TestAPathDeletedWhileItWasHashedIsNotResurrected(t *testing.T) {
+	store := newFakeStore()
+	path := testRoot + "/a.pdf"
+	seedObservation(t, store, path, 100)
+
+	p := newRacingProcessor(store, map[string]string{path: "%PDF-1.4 hello"}, func() {
+		_ = store.tx.DeleteObservation(context.Background(), 1, path)
+	})
+	if err := p.ProcessPath(t.Context(), 1, path); err != nil {
+		t.Fatalf("process: %v", err)
+	}
+
+	if len(store.tx.documents) != 0 {
+		t.Errorf("documents = %v, want none: the path was deleted before the write",
+			store.tx.documents)
+	}
+	if len(store.tx.queuedExtract) != 0 {
+		t.Errorf("extractions = %v, want none", store.tx.queuedExtract)
+	}
+}
+
+// The same window admits a replacement rather than a deletion. The bytes hashed
+// belong to whichever file was there at the time, and the observation the write
+// would use describes the other one; the replacement queued its own job, so
+// leaving it to that job is both correct and already arranged.
+func TestAFileReplacedWhileItWasHashedIsLeftToItsOwnJob(t *testing.T) {
+	store := newFakeStore()
+	path := testRoot + "/a.pdf"
+	seedObservation(t, store, path, 100)
+
+	p := newRacingProcessor(store, map[string]string{path: "%PDF-1.4 hello"}, func() {
+		seedObservation(t, store, path, 999)
+	})
+	if err := p.ProcessPath(t.Context(), 1, path); err != nil {
+		t.Fatalf("process: %v", err)
+	}
+
+	if len(store.tx.documents) != 0 {
+		t.Errorf("documents = %v, want none: the file behind the hash was replaced",
+			store.tx.documents)
 	}
 }
 

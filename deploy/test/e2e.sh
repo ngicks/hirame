@@ -18,8 +18,18 @@ UNITS_FAIL=$RUN/units-migration-failure
 UNITS_QUOTA=$RUN/units-eviction-quota
 LOGS=$RUN/logs
 RESULTS=$RUN/results.tsv
+# The deployment's two configuration directories (D-009), and the harness has
+# to reproduce the split rather than pick one: the Quadlet units are user units
+# naming %h/.config/hirame/..., which the supervisor expands against this
+# namespace's HOME, while overwatch.json belongs to the *system* daemon and
+# lives in /etc/hirame exactly as deploy/systemd/overwatch.service names it.
 CONFIG=$HOME/.config/hirame
-DOCS=$HOME/hirame/documents
+SYSCONFIG=/etc/hirame
+DOCS=/srv/documents
+# The host runtime directory deploy/systemd/overwatch.service declares as
+# RuntimeDirectory=, and the bind source indexer.container mounts. An absolute
+# /run path in both scopes: the daemon is a system service either way.
+OVERWATCH_RUN=/run/overwatch/hirame
 SUP=$HERE/lib/quadlet-supervisor.py
 
 # Host networking makes ports a global resource. These are the deployed values
@@ -36,8 +46,11 @@ PORT_WEB=8080
 API=http://127.0.0.1:$PORT_API
 WEB=http://127.0.0.1:$PORT_WEB
 
-VOLUME_UNITS='hirame-db-volume.service hirame-objectstore-volume.service hirame-overwatch-run-volume.service'
-INFRA_UNITS='postgres.service tika.service gahaku.service versitygw.service versitygw-bootstrap.service overwatch.service'
+VOLUME_UNITS='hirame-db-volume.service hirame-objectstore-volume.service'
+# overwatch.service is absent on purpose: it is not a Quadlet unit any more, so
+# the supervisor has nothing to generate for it. start_fake_overwatch below is
+# what stands in for it, as a host process — the shape the deployment now has.
+INFRA_UNITS='postgres.service tika.service gahaku.service versitygw.service versitygw-bootstrap.service'
 APP_UNITS='hirame-migrate.service search-api.service indexer.service web-gui.service'
 
 # --------------------------------------------------------------------------
@@ -229,6 +242,14 @@ setup() {
 		pnp_require_port "${p%%:*}" "${p#*:}"
 	done
 
+	# The images are checked by the units that name them; these two are not
+	# named by anything, so --no-build after a clean checkout would otherwise
+	# fail inside `timeout` with a bare "No such file or directory".
+	for b in overwatch fakeoverwatch; do
+		[ -x "$HERE/bin/$b" ] ||
+			die "$HERE/bin/$b is missing; run without --no-build"
+	done
+
 	# The units under test are the deployed ones, copied byte for byte; only
 	# the drop-in directories beside them are the harness's. The checksum
 	# below is the proof, and it runs on every start rather than on request.
@@ -240,20 +261,25 @@ setup() {
 	cp -a "$HERE/dropins-eviction-quota/." "$UNITS_QUOTA/"
 	verify_units_unmodified
 
-	install -d -m 0755 "$CONFIG"
+	install -d -m 0700 "$CONFIG"
 	install -m 0644 "$HERE/env/hirame.env" "$CONFIG/hirame.env"
 	install -m 0600 "$HERE/env/secrets.env" "$CONFIG/secrets.env"
 	install -m 0600 "$HERE/env/broken-migration.env" "$CONFIG/broken-migration.env"
 	install -m 0644 "$HERE/env/eviction-quota.env" "$CONFIG/eviction-quota.env"
+	# 0644 because this one is bind-mounted and read by the container's own
+	# uid, unlike the env files, which podman itself reads as --env-file.
 	install -m 0644 "$REPO/deploy/config/postgresql.conf" "$CONFIG/postgresql.conf"
-	install -m 0644 "$REPO/deploy/config/overwatch.json" "$CONFIG/overwatch.json"
+	install -d -m 0755 "$SYSCONFIG"
+	install -m 0644 "$REPO/deploy/config/overwatch.json" "$SYSCONFIG/overwatch.json"
 	# podman silently creates a *directory* for a bind source that does not
 	# exist, which turns a missing config file into a service that started
 	# with defaults rather than into an error.
 	for f in hirame.env secrets.env broken-migration.env eviction-quota.env \
-		postgresql.conf overwatch.json; do
+		postgresql.conf; do
 		[ -f "$CONFIG/$f" ] || die "$CONFIG/$f is not a regular file"
 	done
+	[ -f "$SYSCONFIG/overwatch.json" ] ||
+		die "$SYSCONFIG/overwatch.json is not a regular file"
 
 	# The watched tree is a tmpfs of its own so each run starts from nothing
 	# and no fixture is left in the repository checkout.
@@ -276,32 +302,54 @@ verify_units_unmodified() {
 }
 
 # probe_real_overwatch records, rather than assumes, why the stand-in daemon is
-# used. It is the (a) rung of the preference ladder: if the real daemon ever
-# does start here, the drop-in that swaps the image should be deleted.
+# used. It runs the deployed binary the way deploy/systemd/overwatch.service
+# does -- as a host process, not a container -- so the refusal it records is the
+# one a real install would get. It must run *before* start_fake_overwatch:
+# both bind the same socket, and an "address already in use" would hide the
+# fanotify error this exists to capture.
 probe_real_overwatch() {
 	log "probe: can the real overwatch daemon start here?"
+	install -d -m 0750 "$OVERWATCH_RUN"
 	set +e
-	# Bounded, because a daemon that *did* start would serve forever. Anything
-	# but a prompt nonzero exit is the interesting outcome.
-	timeout 30 "$PODMAN" run --rm --name hirame-overwatch-probe $PNP_FLAGS \
-		--volume "$CONFIG/overwatch.json:/etc/overwatch/config.json:ro" \
-		--volume "$DOCS:/srv/documents:ro" \
-		--cap-add CAP_SYS_ADMIN \
-		localhost/hirame-overwatch:latest \
-		server serve --config /etc/overwatch/config.json >"$LOGS/overwatch-probe.log" 2>&1
+	# Bounded, because a daemon that *did* start would serve forever: 124 is
+	# timeout's own exit status and therefore the "it worked" outcome.
+	timeout 30 "$HERE/bin/overwatch" server serve --config "$SYSCONFIG/overwatch.json" \
+		>"$LOGS/overwatch-probe.log" 2>&1
 	_rc=$?
 	set -e
 	printf 'exit=%d\n' "$_rc"
 	sed 's/^/  | /' "$LOGS/overwatch-probe.log"
-	$PODMAN rm -f hirame-overwatch-probe >/dev/null 2>&1 || true
-	if [ "$_rc" -eq 0 ]; then
-		warn "the real overwatch daemon started; deploy/test/dropins/overwatch.container.d/ can be dropped"
+	if [ "$_rc" -eq 0 ] || [ "$_rc" -eq 124 ]; then
+		warn "the real overwatch daemon started here; the stand-in in start_fake_overwatch is no longer needed"
 	fi
+}
+
+# start_fake_overwatch stands in for deploy/systemd/overwatch.service. A plain
+# background process, because that is what the unit runs: there is no image and
+# no container to override any more, only a binary, a config file and a runtime
+# directory.
+start_fake_overwatch() {
+	log "starting the stand-in overwatch daemon"
+	# systemd creates this before ExecStart (RuntimeDirectory=), and the
+	# ordering matters for the same reason there: podman silently creates a
+	# missing bind source as an empty directory, which would leave the indexer
+	# watching a path no socket ever appears in.
+	install -d -m 0750 "$OVERWATCH_RUN"
+	"$HERE/bin/fakeoverwatch" server serve --config "$SYSCONFIG/overwatch.json" \
+		>"$LOGS/overwatch.log" 2>&1 &
+	FAKE_OVERWATCH_PID=$!
+	wait_for 30 "$HERE/bin/fakeoverwatch" client \
+		--socket "$OVERWATCH_RUN/hirame.sock" status ||
+		die "the stand-in overwatch daemon never answered on $OVERWATCH_RUN/hirame.sock"
+	printf 'stand-in daemon pid=%s socket=%s\n' \
+		"$FAKE_OVERWATCH_PID" "$OVERWATCH_RUN/hirame.sock"
 }
 
 teardown() {
 	log "stopping everything"
 	sup stop "$UNITS" $APP_UNITS $INFRA_UNITS >/dev/null 2>&1 || true
+	[ -n "${FAKE_OVERWATCH_PID:-}" ] && kill "$FAKE_OVERWATCH_PID" 2>/dev/null
+	return 0
 }
 
 # --------------------------------------------------------------------------
@@ -311,6 +359,7 @@ teardown() {
 setup
 probe_real_overwatch
 trap teardown EXIT INT TERM
+start_fake_overwatch
 
 for s in "$HERE"/scenarios/s*.sh; do . "$s"; done
 

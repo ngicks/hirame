@@ -33,6 +33,8 @@ type Config struct {
 	ListenAddr        string
 	ShutdownTimeout   time.Duration
 	ReadHeaderTimeout time.Duration
+	ReadTimeout       time.Duration
+	IdleTimeout       time.Duration
 }
 
 // Handlers is the set of service implementations to mount.
@@ -59,11 +61,19 @@ func NewHandler(h Handlers, opts ...connect.HandlerOption) http.Handler {
 }
 
 // Run serves until ctx is done, then drains within Config.ShutdownTimeout.
+//
+// WriteTimeout is deliberately left unset. It bounds the whole exchange from the
+// end of the request headers, and RenderPage streams a full-size page for as
+// long as Gahaku takes to produce it; any value large enough not to truncate a
+// render would be too large to bound anything else. What a slow reader actually
+// costs is capped by RenderLimit instead, and an idle connection by IdleTimeout.
 func Run(ctx context.Context, cfg Config, handler http.Handler) error {
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           handler,
 		ReadHeaderTimeout: cfg.ReadHeaderTimeout,
+		ReadTimeout:       cfg.ReadTimeout,
+		IdleTimeout:       cfg.IdleTimeout,
 	}
 
 	g, gctx := errgroup.WithContext(ctx)

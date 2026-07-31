@@ -51,9 +51,11 @@ RUN apt-get update \
 		wget \
 	&& rm -rf /var/lib/apt/lists/*
 
-# A fixed uid rather than a name-allocated one: indexer.container runs as
-# 10001:0 so it can reach the overwatch socket through group 0, and that
-# override has to name a uid that exists here.
+# A fixed uid rather than a name-allocated one: indexer.container and
+# search-api.container both run as 10001:0, so that under rootless podman their
+# gid 0 maps to the host service user's primary group — which owns the overwatch
+# socket and the document archive. The override has to name a uid that exists
+# here.
 RUN groupadd --gid 10001 hirame \
 	&& useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin hirame
 

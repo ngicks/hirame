@@ -78,20 +78,25 @@
 
 ## D-009: Quadlet privilege mode
 
-- **Status:** Accepted
-- **Choice:** Rootless Quadlet under a dedicated service user, with the watched
-  mountpoint bind-mounted read-only into the indexer container. Escalate to
-  system units only if a real mountpoint's permissions demand it.
-- **Rationale:** Rootless is the safer default and sufficient when the service
-  user is granted read access to watched paths.
-- **Rejected:** Rootful-by-default operation.
-- **Amendment (2026-07-28):** go-overwatch's fanotify filesystem marks require
-  `CAP_SYS_ADMIN` in the initial user namespace, which no rootless container can
-  provide. The escalation clause applies to the watcher alone: run the overwatch
-  daemon as a system-level unit (rootful container or host daemon per
-  go-overwatch's systemd ops doc) and share its Unix socket with the otherwise
-  rootless stack via a bind mount. In nested/e2e environments without fanotify,
-  ingestion falls back to the indexer's Scan reconciliation path.
+- **Status:** Accepted (user decisions 2026-07-29)
+- **Choice:** Hybrid. All podman usage is **rootless** — Quadlet units run in a
+  dedicated service user's systemd user instance, and images are built with
+  unprivileged podman; rootful podman is not used anywhere. The one exception
+  to user scope is the watcher: the overwatch daemon is not a container at all
+  but a native systemd **system** service (host binary, per go-overwatch's own
+  systemd ops doc), sharing its Unix socket with the rootless indexer container
+  via a bind mount with an access grant that works for a subordinate-id-mapped
+  container process.
+- **Rationale:** go-overwatch's fanotify filesystem marks require
+  `CAP_SYS_ADMIN` in the initial user namespace, which no rootless container
+  can provide — so the watcher must be a system service; everything else stays
+  rootless per the user's explicit direction ("we don't use rootful podman").
+- **Rejected:** Rootful system-scope Quadlet for the container stack (briefly
+  adopted 2026-07-29, reverted the same day by user direction); overwatch as a
+  Quadlet container in either scope (a container buys nothing for a
+  host-filesystem watcher and complicates capability grants).
+- **Note:** In nested/e2e environments without fanotify, ingestion falls back
+  to the indexer's Scan reconciliation path against a stand-in daemon.
 
 ## D-010: Authentication and network exposure
 

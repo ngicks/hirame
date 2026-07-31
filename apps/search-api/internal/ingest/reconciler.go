@@ -493,19 +493,27 @@ func (r *Reconciler) moveDirectory(
 
 // reconcileAll rescans every mountpoint, anchoring each epoch at the same ring
 // head so a failure part way leaves the store at one consistent sequence.
+//
+// The watermark is committed once, after every root has landed, and not inside
+// any one root's transaction. It is a single process-wide value: written by the
+// first root, a failure on the second would leave it nonzero with roots two
+// onwards never scanned, and runOnce only bootstraps while it is zero — so the
+// scan those roots never got would never be retried.
 func (r *Reconciler) reconcileAll(ctx context.Context, head int64) error {
 	for _, mp := range r.mountpoints {
-		if err := r.reconcileRoot(ctx, mp, head); err != nil {
+		if err := r.reconcileRoot(ctx, mp); err != nil {
 			return err
 		}
 	}
-	return nil
+	return r.store.InTx(ctx, func(ctx context.Context, tx Tx) error {
+		return tx.SetWatermark(ctx, head)
+	})
 }
 
 // reconcileRoot pulls a full walk of one root and commits it as a single
 // mark-and-sweep epoch: every observed path is tagged, then whatever still
 // carries an older tag is exactly what was deleted while the stream was blind.
-func (r *Reconciler) reconcileRoot(ctx context.Context, mp Mountpoint, head int64) error {
+func (r *Reconciler) reconcileRoot(ctx context.Context, mp Mountpoint) error {
 	stream, err := r.watcher.Scan(ctx, &overwatchv1.ScanRequest{Root: mp.Root})
 	if err != nil {
 		return fmt.Errorf("scan %s: %w", mp.Root, err)
@@ -532,7 +540,7 @@ func (r *Reconciler) reconcileRoot(ctx context.Context, mp Mountpoint, head int6
 				continue
 			}
 			for _, obs := range batch.GetObservations() {
-				enqueued, err := r.observeScanned(ctx, tx, mp, obs, epoch)
+				enqueued, err := r.observeScanned(ctx, tx, obs, epoch)
 				if err != nil {
 					return err
 				}
@@ -559,7 +567,7 @@ func (r *Reconciler) reconcileRoot(ctx context.Context, mp Mountpoint, head int6
 				}
 			}
 		}
-		return tx.SetWatermark(ctx, head)
+		return nil
 	})
 	if err != nil {
 		return err
@@ -577,6 +585,13 @@ func (r *Reconciler) reconcileRoot(ctx context.Context, mp Mountpoint, head int6
 // observeScanned records one scanned path and reports whether it was queued for
 // ingestion.
 //
+// The mountpoint is resolved per path rather than taken from the scan that
+// produced it, exactly as every event path does. A walk of an outer root also
+// walks any nested root inside it, and writing those paths under the outer
+// mountpoint would give one file two identities: the scan of the nested root
+// records the same path under its own, and each root's epoch sweep would then
+// see the other's rows as unobserved.
+//
 // A rescan re-reads the whole tree, so queueing every file would re-hash it as
 // well. Work is queued only when the stored state cannot already account for
 // the file: nothing recorded, a size or mtime that moved, or an observation
@@ -585,11 +600,14 @@ func (r *Reconciler) reconcileRoot(ctx context.Context, mp Mountpoint, head int6
 func (r *Reconciler) observeScanned(
 	ctx context.Context,
 	tx Tx,
-	mp Mountpoint,
 	obs *overwatchv1.Observation,
 	epoch int64,
 ) (bool, error) {
 	path := obs.GetPath()
+	mp, ok := r.mountpointFor(path)
+	if !ok {
+		return false, nil
+	}
 	next := observationOf(mp.ID, path, obs.GetStat(), false, epoch)
 	// A scan observation carries no directory flag of its own; the mode does.
 	// The daemon converts st_mode to fs.FileMode before it reaches the wire

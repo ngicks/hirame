@@ -6,13 +6,18 @@
 # to the internet, no route in from off-host. Image pulls are unaffected — they
 # happen on the host's network before a container joins this one.
 #
-# The single published port belongs to hirame.pod. Under rootless podman that
-# forward is made by rootlessport, from inside the rootless network namespace to
-# the pod's address, so it never crosses the boundary Internal=true closes; the
-# bridge still gets a gateway address (`podman network inspect` shows one even
-# with --internal). Under a *rootful* install — the D-009 escalation in
-# deploy/README.md, and what the podman-in-podman harness will run — the same
-# forward is host DNAT, which netavark's internal rules may drop.
+# The single published port belongs to hirame.pod and is unaffected: under the
+# rootless podman D-009 selects, a publish is rootlessport forwarding from
+# inside the network namespace, which never crosses the boundary Internal=true
+# closes. (A *rootful* publish would be host DNAT into the bridge, which
+# netavark's internal rules can drop — one of the reasons that arrangement was
+# not kept.)
+#
+# What is verified, here, is only that the bridge is still addressable with
+# --internal: `podman network create --internal` reports subnet 10.89.0.0/24
+# with gateway 10.89.0.1. No container could be started in the environment
+# these files were written in — the podman-in-podman harness runs neither this
+# network nor the pod.
 #
 # So: if the GUI's port does not answer and everything else is healthy, this
 # line is the first suspect. Either drop Internal=true — the isolation D-010

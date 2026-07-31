@@ -165,6 +165,43 @@ func EvictionPeriodicJob(interval time.Duration) *river.PeriodicJob {
 	)
 }
 
+// CacheSweepArgs is the backstop pass over the whole thumbnail cache: rows no
+// live document claims, objects still awaiting deletion, and objects no row
+// accounts for. Like EvictionMaintenanceArgs it carries nothing, because what it
+// sweeps is derived from the database rather than from the job.
+type CacheSweepArgs struct{}
+
+// Kind implements river.JobArgs.
+func (CacheSweepArgs) Kind() string { return "cache_sweep" }
+
+// InsertOpts implements river.JobArgsWithInsertOpts.
+func (CacheSweepArgs) InsertOpts() river.InsertOpts {
+	return river.InsertOpts{
+		// Few attempts, because this is the thing that catches what other jobs
+		// dropped: the next scheduled run is a better retry than an immediate
+		// one against an object store that is evidently unwell.
+		MaxAttempts: 3,
+		UniqueOpts: river.UniqueOpts{
+			ByState: stillOutstanding,
+		},
+	}
+}
+
+// CacheSweepPeriodicJob schedules the backstop sweep at interval.
+//
+// Deliberately not merged into the eviction job: eviction enforces limits and
+// must run often enough to keep the quota honest, while the sweep walks the
+// whole bucket and is only ever repairing something that already went wrong.
+func CacheSweepPeriodicJob(interval time.Duration) *river.PeriodicJob {
+	return river.NewPeriodicJob(
+		river.PeriodicInterval(interval),
+		func() (river.JobArgs, *river.InsertOpts) { return CacheSweepArgs{}, nil },
+		// Not RunOnStart: a restart loop would otherwise walk the whole bucket
+		// on every attempt, and nothing it repairs is urgent.
+		nil,
+	)
+}
+
 // ErrNotBound reports that the enqueuer was used before its River client was
 // attached.
 var ErrNotBound = errors.New("jobs: enqueuer has no River client")

@@ -282,6 +282,52 @@ func TestRenderPagePassesTheSourceAndShapeToTheRenderer(t *testing.T) {
 	}
 }
 
+// Gahaku reads a zero bound as "no limit", so an omitted max_size must not be
+// passed through: a request carrying no size at all would otherwise be the one
+// way to ask for an unbounded raster.
+func TestRenderPageBoundsARequestThatNamesNoSize(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		size          *hiramev1.ImageSize
+		width, height uint32
+	}{
+		{"absent", nil, 2048, 2048},
+		{"zero", &hiramev1.ImageSize{}, 2048, 2048},
+		{"one axis only", &hiramev1.ImageSize{Width: 640}, 640, 2048},
+		{"above the cap", &hiramev1.ImageSize{Width: 99999, Height: 99999}, 5000, 5000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			renderer := newFakeRenderer([]byte("x"))
+			client := newRenderClient(t, newFakeStore(), renderer)
+
+			resp, err := collectRender(t, client, &hiramev1.RenderPageRequest{
+				Ref:        liveRef(),
+				PageNumber: 1,
+				MaxSize:    tc.size,
+			})
+			if err != nil {
+				t.Fatalf("render: %v", err)
+			}
+
+			call := renderer.lastCall(t)
+			if call.MaxWidth != tc.width || call.MaxHeight != tc.height {
+				t.Errorf("bounds = %dx%d, want %dx%d",
+					call.MaxWidth, call.MaxHeight, tc.width, tc.height)
+			}
+			// The info frame reports the bound the render was held to, so a
+			// client is told what it actually got.
+			if len(resp.infos) != 1 {
+				t.Fatalf("got %d info frames, want 1", len(resp.infos))
+			}
+			if got := resp.infos[0].GetSize(); got.GetWidth() != tc.width ||
+				got.GetHeight() != tc.height {
+				t.Errorf("reported size = %dx%d, want %dx%d",
+					got.GetWidth(), got.GetHeight(), tc.width, tc.height)
+			}
+		})
+	}
+}
+
 func TestRenderPageSurfacesARendererFailure(t *testing.T) {
 	renderer := newFakeRenderer()
 	renderer.err = errRenderFailed

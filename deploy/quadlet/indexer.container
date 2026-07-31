@@ -13,8 +13,20 @@ After=hirame-migrate.service
 # retries: a job that cannot reach Tika or the renderer fails and is retried,
 # which is a better failure than a worker pool that refuses to start and leaves
 # the queue unattended.
-Wants=tika.service gahaku.service versitygw-bootstrap.service overwatch.service
-After=tika.service gahaku.service versitygw-bootstrap.service overwatch.service
+#
+# overwatch.service is deliberately NOT in this list. It is a *system* unit
+# (deploy/systemd/overwatch.service) and this is a *user* unit, and systemd's
+# user instance cannot order against the system instance at all — naming it
+# here would resolve to a user unit that does not exist, which systemd ignores
+# with a warning. A dependency that reads as real and is not is worse than none.
+#
+# Nothing is lost, because the edge never carried readiness anyway: the daemon
+# has no sd_notify, so ordering after it only ever meant "it was launched
+# first". What replaces it is the tmpfiles.d entry beside that unit, which
+# guarantees the bind source below exists before any user manager starts, plus
+# a watcher dial that is lazy and retried on WATCH_RECONNECT_BACKOFF.
+Wants=tika.service gahaku.service versitygw-bootstrap.service
+After=tika.service gahaku.service versitygw-bootstrap.service
 
 [Container]
 Image=localhost/hirame-search-api:latest
@@ -23,19 +35,47 @@ Pod=hirame.pod
 EnvironmentFile=%h/.config/hirame/hirame.env
 EnvironmentFile=%h/.config/hirame/secrets.env
 
-# The documents, read-only (D-009). The same host path overwatch.container
-# mounts, at the same container path — WATCH_MOUNTPOINTS names it, and the
-# paths overwatch reports are resolved here.
-Volume=%h/hirame/documents:/srv/documents:ro
+# The documents, read-only (D-009), at the host path unchanged.
+#
+# The identity mapping is load-bearing because overwatch runs on the host: the
+# daemon reports the paths it observed in the *host's* namespace, and this
+# process resolves them in its own. Change the host side to the real
+# mountpoint and change the container side with it, keeping the two equal —
+# together with WATCH_MOUNTPOINTS and the watch root in
+# deploy/config/overwatch.json, which name the same path.
+#
+# Readable through gid 0 for the same reason the socket is: the archive is
+# group-owned by `hirame` and g+rX, and this process's host gid is that group.
+Volume=/srv/documents:/srv/documents:ro
 
-# The overwatch socket. The daemon chmods it 0660 and it is owned by the user
-# the daemon runs as, which is root in its container; group 0 below is what
-# lets this unprivileged process connect without also being uid 0.
-Volume=hirame-overwatch-run.volume:/run/overwatch/hirame
+# The overwatch socket, bind-mounted from the host runtime directory
+# overwatch.service declares as RuntimeDirectory=. An absolute host path, not
+# %t/...: the daemon is a *system* service even though this container is not,
+# so its socket is on the system /run rather than in this user's runtime
+# directory.
+#
+# Read-only is enough: connect(2) needs write permission on the socket *inode*,
+# which a read-only superblock does not withhold (it refuses only regular
+# files, directories and symlinks).
+Volume=/run/overwatch/hirame:/run/overwatch/hirame:ro
 
-# uid 10001 is the image's `hirame` user; the gid override is the socket
-# access described above and nothing else. The process writes nothing that
-# group 0 ownership would matter for.
+# uid 10001 is the image's `hirame` user; the gid override buys the two host
+# resources this process reads — the socket above and the archive above that —
+# and nothing else.
+#
+# This is the whole rootless socket handoff (D-009), and it rests on one
+# property of podman's default rootless mapping: container gid 0 maps to the
+# *primary group of the user running podman*, exactly as container uid 0 maps
+# to that user. So gid 0 here is the host `hirame` group — and
+# deploy/systemd/overwatch.service runs the daemon with Group=hirame, which
+# makes its runtime directory root:hirame 0750 and its socket root:hirame 0660.
+# Group r-x traverses the directory, group rw- connects to the socket.
+#
+# The container's *uid* has no part in it: 10001 maps to a subuid
+# (subuid_start + 10000) that owns nothing on the host. Which is why
+# --userns=keep-id must never be added to this unit — keep-id maps the service
+# user's real uid/gid to themselves and pushes container gid 0 into the subgid
+# range, and every watcher RPC would then fail on a socket it cannot open.
 User=10001:0
 
 Exec=indexer

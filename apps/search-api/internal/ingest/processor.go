@@ -49,6 +49,14 @@ func NewProcessor(
 	return &Processor{store: store, filter: filter, opener: opener, logger: logger}
 }
 
+// promoteAttempts bounds the in-process retries of a lost compare-and-swap.
+//
+// A few is enough: each one re-reads what the winner wrote, and the common
+// outcome of losing is that the winner promoted the very version this job was
+// going to, which the re-read then recognizes as nothing to do. Exhausting them
+// hands the job back to River rather than looping.
+const promoteAttempts = 3
+
 // ProcessPath brings one path's document and content version up to date.
 //
 // A path that has since been deleted, turned into a directory, or stopped
@@ -83,8 +91,53 @@ func (p *Processor) ProcessPath(ctx context.Context, mountpointID int64, path st
 		return nil
 	}
 
-	return p.store.InTx(ctx, func(ctx context.Context, tx Tx) error {
-		doc, err := p.resolveDocument(ctx, tx, mountpointID, path, obs, digest)
+	for range promoteAttempts {
+		settled, err := p.promote(ctx, mountpointID, path, obs, digest, size)
+		if err != nil {
+			return err
+		}
+		if settled {
+			return nil
+		}
+	}
+	return fmt.Errorf(
+		"promote %s: document changed under %d attempts", path, promoteAttempts)
+}
+
+// errVersionRaced reports a compare-and-swap another writer won. The whole
+// transaction is rolled back on it rather than committed, so the retry rebuilds
+// its decisions from what the winner left rather than from a stale read.
+var errVersionRaced = errors.New("ingest: document version changed under this job")
+
+// promote runs the write half of ProcessPath, reporting whether it settled the
+// path. A false with no error means the compare-and-swap was lost and the caller
+// should try again.
+func (p *Processor) promote(
+	ctx context.Context,
+	mountpointID int64,
+	path string,
+	observed Observation,
+	digest string,
+	size int64,
+) (bool, error) {
+	err := p.store.InTx(ctx, func(ctx context.Context, tx Tx) error {
+		// The observation is re-read here, not trusted from the read that
+		// preceded the hash. A delete landing in between drops the row and
+		// tombstones the document, and neither is visible to the lookups below:
+		// FindLiveDocumentByPath skips tombstones and the partial unique index
+		// allows the insert, so creating from a stale observation would mint a
+		// live document for a path that no longer exists — one no later event
+		// mentions, whose extraction job finds no file, and which only a full
+		// rescan would ever clear.
+		current, found, err := tx.GetObservation(ctx, mountpointID, path)
+		if err != nil {
+			return err
+		}
+		if !found || current.IsDir || !sameFile(observed, current) {
+			return nil
+		}
+
+		doc, err := p.resolveDocument(ctx, tx, mountpointID, path, current, digest)
 		if err != nil {
 			return err
 		}
@@ -100,8 +153,12 @@ func (p *Processor) ProcessPath(ctx context.Context, mountpointID int64, path st
 		}
 
 		superseded := doc.CurrentContentVersionID
-		if err := tx.SetDocumentCurrentVersion(ctx, doc.ID, versionID); err != nil {
+		swapped, err := tx.SetDocumentCurrentVersion(ctx, doc.ID, superseded, versionID)
+		if err != nil {
 			return err
+		}
+		if !swapped {
+			return errVersionRaced
 		}
 		if err := tx.MarkExtractionPending(ctx, versionID); err != nil {
 			return err
@@ -110,8 +167,10 @@ func (p *Processor) ProcessPath(ctx context.Context, mountpointID int64, path st
 			return err
 		}
 		if superseded != 0 {
-			// Committed with the flip, so the thumbnails of the version this
-			// document just stopped pointing at can never outlive it silently.
+			// Committed with the flip, and with the flip proven to be this
+			// job's, so the version named here is the one this document really
+			// stopped pointing at rather than one a concurrent job already
+			// superseded.
 			if err := tx.EnqueueInvalidateThumbnails(ctx, doc.ID, superseded); err != nil {
 				return err
 			}
@@ -125,6 +184,19 @@ func (p *Processor) ProcessPath(ctx context.Context, mountpointID int64, path st
 		)
 		return nil
 	})
+	if errors.Is(err, errVersionRaced) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+// sameFile reports whether two observations of one path describe the same file.
+// A zero inode is an event that carried no stat and so contradicts nothing.
+func sameFile(a, b Observation) bool {
+	if a.Ino == 0 || b.Ino == 0 {
+		return true
+	}
+	return a.Dev == b.Dev && a.Ino == b.Ino
 }
 
 // resolveDocument finds the document this path belongs to, in the order

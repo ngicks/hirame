@@ -51,6 +51,11 @@ type Config struct {
 	// UsePathStyle addresses buckets as a path under one endpoint. VersityGW
 	// has no per-bucket virtual host, so this is normally true.
 	UsePathStyle bool
+	// Timeout bounds one request to the gateway, as in the tika and gahakuclient
+	// packages. Without it a gateway that accepts a connection and then stops
+	// answering holds a request — and, on the thumbnail path, a render slot —
+	// until the caller's own context expires. 0 leaves the client unbounded.
+	Timeout time.Duration
 }
 
 // Store is a bucket in one S3 gateway.
@@ -77,6 +82,7 @@ func New(cfg Config) (*Store, error) {
 		Credentials: credentials.NewStaticCredentialsProvider(
 			cfg.AccessKeyID, cfg.SecretAccessKey, "",
 		),
+		HTTPClient: &http.Client{Timeout: cfg.Timeout},
 	})
 	return &Store{
 		bucket:  cfg.Bucket,

@@ -70,6 +70,22 @@ type fakeTx struct {
 	queuedExtract    []int64
 	queuedInvalidate []invalidateCall
 	pendingExtracts  []int64
+
+	// onDocumentRead fires once, immediately after a document lookup has taken
+	// its snapshot. It is how a test stages the concurrent writer a
+	// compare-and-swap exists to notice: the caller goes on holding the value it
+	// read while the stored row has already moved on, which is what READ
+	// COMMITTED gives a second transaction that commits in between.
+	onDocumentRead func()
+}
+
+func (t *fakeTx) fireDocumentRead() {
+	if t.onDocumentRead == nil {
+		return
+	}
+	hook := t.onDocumentRead
+	t.onDocumentRead = nil
+	hook()
 }
 
 func key(mountpointID int64, path string) string {
@@ -163,7 +179,9 @@ func (t *fakeTx) FindLiveDocumentByPath(
 ) (ingest.Document, bool, error) {
 	for _, doc := range t.documents {
 		if doc.MountpointID == mountpointID && doc.Path == path && t.live(doc.ID) {
-			return *doc, true, nil
+			snapshot := *doc
+			t.fireDocumentRead()
+			return snapshot, true, nil
 		}
 	}
 	return ingest.Document{}, false, nil
@@ -300,16 +318,28 @@ func (t *fakeTx) UpsertContentVersion(
 	return t.nextVersionID, nil
 }
 
+// setVersion is fixture setup: it puts a document at a version without going
+// through the compare-and-swap, which a test arranging a starting state has no
+// expectation to compare against.
+func (t *fakeTx) setVersion(documentID, contentVersionID int64) {
+	t.documents[documentID].CurrentContentVersionID = contentVersionID
+}
+
+// SetDocumentCurrentVersion mirrors the query's compare-and-swap: no row is
+// touched, and none reported, when the expectation no longer holds.
 func (t *fakeTx) SetDocumentCurrentVersion(
 	_ context.Context,
-	documentID, contentVersionID int64,
-) error {
+	documentID, expected, contentVersionID int64,
+) (bool, error) {
 	doc, ok := t.documents[documentID]
 	if !ok {
-		return fmt.Errorf("no document %d", documentID)
+		return false, fmt.Errorf("no document %d", documentID)
+	}
+	if doc.CurrentContentVersionID != expected {
+		return false, nil
 	}
 	doc.CurrentContentVersionID = contentVersionID
-	return nil
+	return true, nil
 }
 
 func (t *fakeTx) MarkExtractionPending(_ context.Context, contentVersionID int64) error {
@@ -353,6 +383,9 @@ type fakeWatcher struct {
 	scanned map[string][]*overwatchv1.Observation
 	head    uint64
 	scans   []string
+	// scanErr fails the scan of one root, which is how a bootstrap covering
+	// several mountpoints is interrupted part way through.
+	scanErr map[string]error
 	// roots is what the daemon reports it is watching, which is configured
 	// separately from this process's mountpoints and can disagree with them.
 	roots []string
@@ -380,6 +413,9 @@ func (w *fakeWatcher) Scan(
 	req *overwatchv1.ScanRequest,
 ) (ingest.ScanStream, error) {
 	w.scans = append(w.scans, req.GetRoot())
+	if err, ok := w.scanErr[req.GetRoot()]; ok {
+		return nil, err
+	}
 	obs := w.scanned[req.GetRoot()]
 	return &sliceStream[overwatchv1.ScanResponse]{items: []*overwatchv1.ScanResponse{{
 		Item: &overwatchv1.ScanResponse_Batch{

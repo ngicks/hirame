@@ -1,0 +1,125 @@
+# The fanotify watcher whose event stream starts the whole pipeline — a host
+# binary under the *system* systemd, not a container (D-009). It is the one
+# thing in this deployment that is not rootless; everything else runs as
+# Quadlet units in the `hirame` user's own systemd instance.
+#
+# WHY NOT A QUADLET UNIT. fanotify *filesystem* marks require CAP_SYS_ADMIN in
+# the **initial** user namespace, which no rootless container can grant:
+# AddCapability= grants it inside the container's namespace, and the daemon
+# then refuses to start rather than degrading silently. A container buys
+# nothing for a process whose whole job is to hold a mark on a host mountpoint
+# either — it would need the host's mount namespace, the host's capability set,
+# and a shared runtime directory anyway, at which point the container is only
+# an image to keep in step.
+#
+# Install (after the `hirame` service user exists — Group= below names it):
+#
+#	cd go-overwatch/overwatch
+#	GOWORK=off go build -trimpath -ldflags '-s -w' -o /tmp/overwatch ./cmd/overwatch
+#	sudo install -Dm0755 /tmp/overwatch /usr/local/bin/overwatch
+#	sudo install -Dm0644 deploy/config/overwatch.json /etc/hirame/overwatch.json
+#	sudo install -Dm0644 deploy/systemd/overwatch.service \
+#	                     /etc/systemd/system/overwatch.service
+#	sudo systemctl daemon-reload && sudo systemctl enable --now overwatch.service
+#
+# /etc/hirame/ holds this one file: it is the *system* half of the deployment's
+# configuration, and the rootless half lives in the service user's own
+# ~/.config/hirame/ where its units can reach it as %h.
+#
+# `go install ...@latest` does not work for this module: its zip contains
+# e2e/vm-truenas/con.py, and `con` is a reserved path component on Windows, so
+# the proxy and sum.golang.org refuse to serve it. The submodule checkout is the
+# only source, which is also what D-006 wants — the revision this repository's
+# index records is the reference.
+
+[Unit]
+Description=overwatch filesystem watcher for the hirame deployment
+Documentation=https://github.com/ngicks/go-overwatch
+
+# local-fs.target is go-overwatch's own ordering (doc/ops/systemd.md). The
+# RequiresMountsFor below is the sharper form of the same concern: the watched
+# tree is normally a mount of its own, and a mark taken on the empty
+# mountpoint underneath it would watch nothing while reporting success.
+After=local-fs.target
+RequiresMountsFor=/srv/documents
+
+[Service]
+Type=simple
+
+# Not Type=notify: overwatch implements no sd_notify protocol (its ops doc says
+# so explicitly), so the unit is "started" the moment the process forks and
+# before the socket exists. Nothing in this deployment depends on that edge —
+# see the readiness section of deploy/README.md for why indexer.service can
+# order after this unit without a readiness guarantee.
+ExecStart=/usr/local/bin/overwatch server serve --config /etc/hirame/overwatch.json
+
+# On restart the daemon emits a STREAM_START gap marker and the indexer
+# rescans, so a restart costs one reconciliation pass rather than lost events.
+Restart=on-failure
+RestartSec=5s
+
+# The socket directory, created by systemd rather than by the daemon's own
+# MkdirAll. That ordering is what makes the indexer's bind mount safe: podman
+# silently creates a missing bind source as an empty directory, so a container
+# that started before the daemon's mkdir would mount an empty directory that no
+# socket ever appears in. systemd creates this before ExecStart.
+#
+# Nested, so /run/overwatch/hirame is the mount source rather than its parent.
+# Preserve=yes keeps the *directory inode* across a daemon restart, which is
+# what a running indexer container has mounted; without it, a `systemctl restart
+# overwatch` would leave every container holding a deleted directory.
+RuntimeDirectory=overwatch/hirame
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+
+# Runs as root — fanotify filesystem marks need CAP_SYS_ADMIN in the initial
+# user namespace — but with the *group* of the rootless service user that runs
+# the Quadlet stack. That single line is the whole socket handoff (D-009):
+#
+#   * systemd owns the innermost RuntimeDirectory= by User=:Group=, so
+#     /run/overwatch/hirame is root:hirame 0750. The daemon's own
+#     MkdirAll(dir, 0750) then finds it already there and changes nothing.
+#     The parent /run/overwatch is *not* covered — Group= applies to the last
+#     component, not to directories created along the way — so its traverse bit
+#     comes from hirame-overwatch.tmpfiles.conf, which pins it 0755 root:root.
+#   * The daemon creates the socket with this egid and chmods it 0660
+#     (grpcserver/grpc_server.go:224,240 — neither the mode nor the group is
+#     configurable, overwatch.json has no key for either), so the socket is
+#     root:hirame 0660.
+#   * indexer.container runs `User=10001:0`, and podman's default rootless
+#     mapping maps container gid 0 to the primary group of the user running
+#     podman. That is this group, so the container gets r-x on the directory
+#     and rw- on the socket.
+#
+# Group= must name the service user's *primary* group; the container's gid 0
+# resolves to that one and to no other. It also has to exist before this unit
+# first starts, which is why deploy/README.md creates the service user first.
+#
+# Setting Group= costs no capability: the process keeps uid 0, so the bounding
+# set below is what actually bounds it.
+Group=hirame
+
+# CAP_DAC_READ_SEARCH beyond the ops doc's bare CAP_SYS_ADMIN: that doc bounds a
+# *non-root* service account, which never held root's DAC bypass in the first
+# place. A root process bounded to CAP_SYS_ADMIN alone loses it, and then
+# cannot traverse a document tree whose directories it does not own — which is
+# most archives. These two are all a watcher needs: read-traverse anywhere, and
+# the fanotify mark.
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH
+NoNewPrivileges=yes
+
+# Watching needs read access and nothing else, so a read-only filesystem view
+# costs the daemon nothing. RuntimeDirectory= is writable under it implicitly;
+# ReadWritePaths= repeats that as documentation, following the ops doc.
+ProtectSystem=strict
+ReadWritePaths=/run/overwatch
+PrivateTmp=yes
+
+# read-only rather than the ops doc's ProtectHome=yes: `yes` makes /home, /root
+# and /run/user invisible, which silently empties a watch root pointed at a
+# home directory. Read-only keeps such a root watchable while still denying
+# writes.
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

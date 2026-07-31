@@ -118,7 +118,14 @@ type Tx interface {
 	) ([]Document, error)
 
 	UpsertContentVersion(ctx context.Context, hash string, size int64) (int64, error)
-	SetDocumentCurrentVersion(ctx context.Context, documentID, contentVersionID int64) error
+	// SetDocumentCurrentVersion swaps the document's current version, reporting
+	// false when expected is no longer what the row holds. It is a
+	// compare-and-swap rather than a plain write because the expectation is read
+	// in an earlier transaction — hashing sits between the two — so a second job
+	// for the same path can have moved the document in the meantime.
+	SetDocumentCurrentVersion(
+		ctx context.Context, documentID, expected, contentVersionID int64,
+	) (bool, error)
 	MarkExtractionPending(ctx context.Context, contentVersionID int64) error
 
 	EnqueueIngestPath(

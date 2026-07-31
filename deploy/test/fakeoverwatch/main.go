@@ -3,12 +3,13 @@
 //
 // fanotify filesystem marks require CAP_SYS_ADMIN in the *initial* user
 // namespace. The end-to-end harness runs inside a nested user namespace where
-// no depth can supply that, so overwatch.container's real image refuses to
-// start — correctly, and by design (D-009's amendment). This binary answers the
-// same OverwatchService on the same unix socket, reading the same
-// deploy/config/overwatch.json, and accepting the same two argv shapes
-// overwatch.container uses, so the unit under test needs no override but
-// Image=.
+// no depth can supply that, so the real daemon refuses to start — correctly,
+// and by design (D-009's amendment); e2e.sh runs it once and records the
+// refusal. This binary answers the same OverwatchService on the same unix
+// socket, reading the same deploy/config/overwatch.json, and accepting the same
+// two argv shapes deploy/systemd/overwatch.service and the harness use — so it
+// substitutes for that unit exactly, as a host process the harness starts by
+// hand rather than through systemd.
 //
 // It is honest about exactly one thing and fakes exactly one thing:
 //
@@ -63,10 +64,11 @@ func main() {
 	}
 }
 
-// run dispatches the two argv shapes overwatch.container uses: `server serve
-// --config <path>` from Exec= and `client --socket <path> status` from
-// HealthCmd=. Anything else is a mismatch between this stand-in and the unit,
-// which should be loud.
+// run dispatches the two argv shapes the harness uses: `server serve --config
+// <path>`, which is deploy/systemd/overwatch.service's ExecStart, and `client
+// --socket <path> status`, which is how e2e.sh waits for the socket. Anything
+// else is a mismatch between this stand-in and the deployment, which should be
+// loud.
 func run(args []string) error {
 	if len(args) == 0 {
 		return errors.New(
@@ -172,8 +174,9 @@ func runServer(args []string) error {
 	return server.Serve(listener)
 }
 
-// runClient implements the one client call overwatch.container's HealthCmd
-// makes. It is a readiness probe, so it reports only whether Status answered.
+// runClient implements the one client call the harness makes while waiting for
+// the socket, the same shape deploy/README.md's install check uses. It is a
+// readiness probe, so it reports only whether Status answered.
 func runClient(args []string) error {
 	flags := flag.NewFlagSet("client", flag.ContinueOnError)
 	socket := flags.String("socket", "", "path to the daemon's unix socket")
@@ -186,7 +189,10 @@ func runClient(args []string) error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	conn, err := grpc.NewClient("unix://"+*socket, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(
+		"unix://"+*socket,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
 	if err != nil {
 		return err
 	}

@@ -57,9 +57,10 @@ func (ix *Indexer) Run(ctx context.Context) error {
 	filter := doctype.NewFilter(ix.cfg.Watch.IncludeExtensions)
 
 	tikaClient, err := tika.New(tika.Config{
-		BaseURL:  ix.cfg.Tika.BaseURL,
-		Timeout:  ix.cfg.Tika.Timeout,
-		MaxBytes: ix.cfg.Tika.MaxBytes,
+		BaseURL:          ix.cfg.Tika.BaseURL,
+		Timeout:          ix.cfg.Tika.Timeout,
+		MaxBytes:         ix.cfg.Tika.MaxBytes,
+		MaxResponseBytes: ix.cfg.Tika.MaxResponseBytes,
 	})
 	if err != nil {
 		return err
@@ -71,6 +72,7 @@ func (ix *Indexer) Run(ctx context.Context) error {
 		SecretAccessKey: ix.cfg.Storage.SecretAccessKey,
 		Bucket:          ix.cfg.Storage.Bucket,
 		UsePathStyle:    ix.cfg.Storage.UsePathStyle,
+		Timeout:         ix.cfg.Storage.Timeout,
 	})
 	if err != nil {
 		return err
@@ -180,6 +182,7 @@ func (ix *Indexer) newRiverClient(
 		ix.cfg.Storage.MaxCacheBytes,
 		ix.logger,
 	))
+	river.AddWorker(workers, jobs.NewCacheSweepWorker(queries, objects, ix.logger))
 
 	client, err := river.NewClient(riverpgxv5.New(pool), &river.Config{
 		Logger:  ix.logger,
@@ -193,6 +196,7 @@ func (ix *Indexer) newRiverClient(
 		},
 		PeriodicJobs: []*river.PeriodicJob{
 			jobs.EvictionPeriodicJob(ix.cfg.Storage.EvictionInterval),
+			jobs.CacheSweepPeriodicJob(ix.cfg.Storage.SweepInterval),
 		},
 	})
 	if err != nil {

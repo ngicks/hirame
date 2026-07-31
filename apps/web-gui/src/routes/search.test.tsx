@@ -95,6 +95,28 @@ describe("SearchPage", () => {
     expect(queries).toEqual(["日本語"]);
   });
 
+  // SearchDocuments produces one snippet per hit and the server clamps
+  // max_snippets to 1. Asking for more describes a response the API cannot
+  // return, which reads as a feature the GUI has and does not.
+  it("asks for the number of snippets the API can actually return", async () => {
+    const requested: number[] = [];
+    const transport = createRouterTransport((router) => {
+      router.service(SearchService, {
+        search: (request) => {
+          requested.push(request.maxSnippets);
+          return { hits: [REPORT], nextPageToken: "", estimatedTotalHits: 1n };
+        },
+      });
+      servesThumbnails(router);
+    });
+
+    renderRoute(<SearchPage />, { transport, url: "/" });
+    typeQuery("日本語");
+
+    expect(await screen.findByText("報告書.pdf")).toBeTruthy();
+    expect(requested).toEqual([1]);
+  });
+
   it("renders title, path and score for each hit", async () => {
     const transport = createRouterTransport((router) => {
       router.service(SearchService, {

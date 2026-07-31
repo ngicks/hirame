@@ -28,15 +28,19 @@ Network=hirame.network
 # a systemd drop-in can override without rewriting the unit.
 Environment=GAHAKU_LISTEN=:9000
 
-# Both of these relax an input guard the binary turns on by default, and both
-# have to come off for a gateway that speaks plain http on a podman network:
+# The input guards stay on, at their defaults.
+#
+# They would have to be relaxed for a presigned-url flow against versitygw:
 # GAHAKU_INPUT_BLOCK_PRIVATE_ADDRESSES refuses exactly the RFC1918 addresses
 # hirame.network hands out, and GAHAKU_INPUT_ALLOW_HTTP the plain-http scheme
-# versitygw serves. The cost is that gahaku will fetch and upload to any url a
-# caller names — acceptable only because the only callers are search-api and
-# the indexer, which sign every url themselves.
-Environment=GAHAKU_INPUT_ALLOW_HTTP=true
-Environment=GAHAKU_INPUT_BLOCK_PRIVATE_ADDRESSES=false
+# the gateway serves. Nothing uses that flow — search-api and the indexer stream
+# document bytes to gahaku over gRPC and never hand it a url (see
+# internal/gahakuclient, and objstore's PresignGet/PresignPut, which have no
+# caller) — so turning the guards off bought nothing and left gahaku willing to
+# fetch and upload to any url a caller named.
+#
+# Set both of these if PresignGet/PresignPut ever gain a caller; until then this
+# unit is the record that they were removed on purpose.
 
 # Has to outlive the slowest render: it is the deadline a worker subprocess is
 # killed on, and office conversions pay soffice's startup. Kept at or under the

@@ -32,15 +32,23 @@ EnvironmentFile=%h/.config/hirame/hirame.env
 EnvironmentFile=%h/.config/hirame/secrets.env
 
 # The documents, read-only (D-009) — the same host path and container path
-# indexer.container and overwatch.container mount, because documents.path is
-# stored absolute and resolved here unchanged.
+# indexer.container mounts, and the same path the host's overwatch.service
+# watches, because documents.path is stored absolute and resolved here
+# unchanged.
 #
 # The API reads them because renders stream to Gahaku as a byte stream: Gahaku
 # holds no mount of its own, and pointing it at a local_path instead would mean
 # mounting the documents into the renderer too and allowlisting a root there.
 # Without this the render and thumbnail RPCs fail on every document while search
 # keeps working, which is a confusing way to be broken.
-Volume=%h/hirame/documents:/srv/documents:ro
+Volume=/srv/documents:/srv/documents:ro
+
+# Same uid and gid as indexer.container, for the archive rather than for a
+# socket: under rootless podman container gid 0 is the host `hirame` group, so
+# this is what lets /srv/documents stay group-readable instead of having to be
+# world-readable. The image's own USER would be 10001:10001, whose gid maps to
+# a subgid that owns nothing. deploy/README.md has the full mapping argument.
+User=10001:0
 
 # server.HealthPath, deliberately outside server.APIPrefix so readiness does
 # not depend on the RPC stack. The address is LISTEN_ADDR from hirame.env;

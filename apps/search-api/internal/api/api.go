@@ -49,6 +49,7 @@ func (a *API) Run(ctx context.Context) error {
 		SecretAccessKey: a.cfg.Storage.SecretAccessKey,
 		Bucket:          a.cfg.Storage.Bucket,
 		UsePathStyle:    a.cfg.Storage.UsePathStyle,
+		Timeout:         a.cfg.Storage.Timeout,
 	})
 	if err != nil {
 		return err
@@ -64,9 +65,9 @@ func (a *API) Run(ctx context.Context) error {
 	defer func() { _ = renderer.Close() }()
 
 	queries := sqlcgen.New(pool)
-	// One limit for both render paths: the knob describes this process's hold
-	// on Gahaku, not one service's.
+	// One cap per render class, not one for the process: see RenderLimit.
 	renderLimit := service.NewRenderLimit(a.cfg.Concurrency.Render)
+	thumbnailLimit := service.NewRenderLimit(a.cfg.Concurrency.Thumbnail)
 
 	handler := server.NewHandler(
 		server.Handlers{
@@ -74,7 +75,7 @@ func (a *API) Run(ctx context.Context) error {
 			Document: service.NewDocument(queries),
 			Render:   service.NewRender(queries, renderer, renderLimit),
 			Thumbnail: service.NewThumbnail(
-				queries, objects, renderer, renderLimit, a.logger,
+				queries, objects, renderer, thumbnailLimit, a.logger,
 			),
 		},
 		connect.WithInterceptors(server.NewLoggingInterceptor(a.logger)),
@@ -84,6 +85,7 @@ func (a *API) Run(ctx context.Context) error {
 		slog.String("addr", a.cfg.Server.ListenAddr),
 		slog.String("api_prefix", server.APIPrefix),
 		slog.Int("render_concurrency", max(a.cfg.Concurrency.Render, 1)),
+		slog.Int("thumbnail_concurrency", max(a.cfg.Concurrency.Thumbnail, 1)),
 		slog.String("gahaku", a.cfg.Gahaku.Target),
 		slog.String("s3_endpoint", a.cfg.Storage.Endpoint),
 	)
@@ -92,6 +94,8 @@ func (a *API) Run(ctx context.Context) error {
 		ListenAddr:        a.cfg.Server.ListenAddr,
 		ShutdownTimeout:   a.cfg.Server.ShutdownTimeout,
 		ReadHeaderTimeout: a.cfg.Server.ReadHeaderTimeout,
+		ReadTimeout:       a.cfg.Server.ReadTimeout,
+		IdleTimeout:       a.cfg.Server.IdleTimeout,
 	}, handler); err != nil {
 		return err
 	}

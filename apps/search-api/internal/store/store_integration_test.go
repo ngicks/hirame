@@ -9,14 +9,17 @@ package store_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -666,12 +669,209 @@ func TestThumbnailEviction(t *testing.T) {
 		t.Errorf("age candidates returned %d rows, want 3", len(aged))
 	}
 
-	deleted, err := q.DeleteThumbnails(ctx, []int64{overflow[0].ID})
+	marked, err := q.MarkThumbnailsPendingDelete(ctx, []int64{overflow[0].ID})
 	if err != nil {
-		t.Fatalf("delete thumbnails: %v", err)
+		t.Fatalf("withdraw thumbnails: %v", err)
 	}
-	if len(deleted) != 1 || deleted[0].ObjectKey != overflow[0].ObjectKey {
-		t.Errorf("delete returned %v", deleted)
+	if marked != 1 {
+		t.Errorf("withdrew %d rows, want 1", marked)
+	}
+
+	// A withdrawn row is out of every read and out of both candidate queries: it
+	// is the drain's now, and offering it again would evict it twice.
+	if _, err := q.GetThumbnail(ctx, sqlcgen.GetThumbnailParams{
+		ContentVersionID: versions[order[0]],
+		Page:             1, Width: 320, Height: 240, Format: "webp",
+	}); !errors.Is(err, pgx.ErrNoRows) {
+		t.Errorf("get on a withdrawn row = %v, want no rows", err)
+	}
+	stillAged, err := q.ThumbnailEvictionCandidatesByAge(ctx,
+		sqlcgen.ThumbnailEvictionCandidatesByAgeParams{
+			OlderThan:   timestamptz(time.Now().Add(time.Hour)),
+			ResultLimit: 10,
+		})
+	if err != nil {
+		t.Fatalf("age candidates: %v", err)
+	}
+	if len(stillAged) != 2 {
+		t.Errorf("age candidates returned %d rows, want the 2 not withdrawn", len(stillAged))
+	}
+
+	pending, err := q.PendingDeleteThumbnails(ctx, 10)
+	if err != nil {
+		t.Fatalf("pending deletes: %v", err)
+	}
+	if len(pending) != 1 || pending[0].ObjectKey != overflow[0].ObjectKey {
+		t.Fatalf("pending deletes = %v, want the withdrawn row", pending)
+	}
+
+	purged, err := q.PurgeThumbnails(ctx, []int64{pending[0].ID})
+	if err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+	if purged != 1 {
+		t.Errorf("purged %d rows, want 1", purged)
+	}
+}
+
+// The regression the pending mark exists for: a job that commits its accounting
+// change and then fails to remove one object must find that object again on its
+// next attempt, rather than a delete that matches nothing and reports success.
+func TestWithdrawnThumbnailsSurviveUntilTheirObjectsAreGone(t *testing.T) {
+	_, q := migrated(t)
+	ctx := t.Context()
+	_, byPath := seedCorpus(t, q)
+
+	doc, err := q.GetDocument(ctx, byPath["/srv/docs/sekkei.txt"])
+	if err != nil {
+		t.Fatalf("get document: %v", err)
+	}
+	spec := sqlcgen.UpsertThumbnailParams{
+		ContentVersionID: *doc.CurrentContentVersionID,
+		Page:             1, Width: 320, Height: 240, Format: "webp",
+		ObjectKey: "thumb/stuck.webp", SizeBytes: 512,
+	}
+	row, err := q.UpsertThumbnail(ctx, spec)
+	if err != nil {
+		t.Fatalf("seed thumbnail: %v", err)
+	}
+	if _, err := q.MarkThumbnailsPendingDelete(ctx, []int64{row.ID}); err != nil {
+		t.Fatalf("withdraw: %v", err)
+	}
+
+	// The attempt that could not reach the gateway purges nothing, so the row is
+	// still there for the next one to derive its work from.
+	again, err := q.PendingDeleteThumbnails(ctx, 10)
+	if err != nil {
+		t.Fatalf("pending deletes: %v", err)
+	}
+	if len(again) != 1 || again[0].ObjectKey != "thumb/stuck.webp" {
+		t.Fatalf("pending deletes = %v, want the object still outstanding", again)
+	}
+
+	// A re-render republishes the entry at the same key. Clearing the mark is
+	// what stops a drain still holding the old id from purging a live row.
+	republished, err := q.UpsertThumbnail(ctx, spec)
+	if err != nil {
+		t.Fatalf("republish: %v", err)
+	}
+	if republished.ID != row.ID {
+		t.Fatalf("republish created a second row: %d then %d", row.ID, republished.ID)
+	}
+	if republished.PendingDeleteAt.Valid {
+		t.Error("republishing left the withdrawal mark in place")
+	}
+	purged, err := q.PurgeThumbnails(ctx, []int64{row.ID})
+	if err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+	if purged != 0 {
+		t.Errorf("purged %d republished rows, want 0", purged)
+	}
+	if _, err := q.GetThumbnail(ctx, sqlcgen.GetThumbnailParams{
+		ContentVersionID: spec.ContentVersionID,
+		Page:             1, Width: 320, Height: 240, Format: "webp",
+	}); err != nil {
+		t.Errorf("republished entry is not readable again: %v", err)
+	}
+}
+
+// The orphan sweep's question, asked one listing page at a time: a key the
+// answer omits is an object no row can reach. A withdrawn row still counts as a
+// reference, because the drain owns that object.
+func TestReferencedThumbnailObjectKeysSeparatesOrphansFromOwnedObjects(t *testing.T) {
+	_, q := migrated(t)
+	ctx := t.Context()
+	_, byPath := seedCorpus(t, q)
+
+	doc, err := q.GetDocument(ctx, byPath["/srv/docs/sekkei.txt"])
+	if err != nil {
+		t.Fatalf("get document: %v", err)
+	}
+	live, err := q.UpsertThumbnail(ctx, sqlcgen.UpsertThumbnailParams{
+		ContentVersionID: *doc.CurrentContentVersionID,
+		Page:             1, Width: 320, Height: 240, Format: "webp",
+		ObjectKey: "thumb/live.webp", SizeBytes: 10,
+	})
+	if err != nil {
+		t.Fatalf("seed live thumbnail: %v", err)
+	}
+	withdrawn, err := q.UpsertThumbnail(ctx, sqlcgen.UpsertThumbnailParams{
+		ContentVersionID: *doc.CurrentContentVersionID,
+		Page:             2, Width: 320, Height: 240, Format: "webp",
+		ObjectKey: "thumb/withdrawn.webp", SizeBytes: 10,
+	})
+	if err != nil {
+		t.Fatalf("seed withdrawn thumbnail: %v", err)
+	}
+	if _, err := q.MarkThumbnailsPendingDelete(ctx, []int64{withdrawn.ID}); err != nil {
+		t.Fatalf("withdraw: %v", err)
+	}
+
+	referenced, err := q.ReferencedThumbnailObjectKeys(ctx, []string{
+		live.ObjectKey, withdrawn.ObjectKey, "thumb/orphan.webp",
+	})
+	if err != nil {
+		t.Fatalf("referenced keys: %v", err)
+	}
+	slices.Sort(referenced)
+	want := []string{"thumb/live.webp", "thumb/withdrawn.webp"}
+	if !slices.Equal(referenced, want) {
+		t.Errorf("referenced = %v, want %v", referenced, want)
+	}
+}
+
+// The compare-and-swap that keeps two ingest jobs for one path from invalidating
+// each other's version. Both read, both hash outside any transaction, and the
+// loser must be told rather than allowed to overwrite.
+func TestSetDocumentCurrentVersionRefusesAStaleExpectation(t *testing.T) {
+	_, q := migrated(t)
+	ctx := t.Context()
+	_, byPath := seedCorpus(t, q)
+
+	docID := byPath["/srv/docs/sekkei.txt"]
+	doc, err := q.GetDocument(ctx, docID)
+	if err != nil {
+		t.Fatalf("get document: %v", err)
+	}
+	original := *doc.CurrentContentVersionID
+
+	winner, err := q.UpsertContentVersion(ctx, sqlcgen.UpsertContentVersionParams{
+		ContentHash: "cas-winner", SizeBytes: 1,
+	})
+	if err != nil {
+		t.Fatalf("winner version: %v", err)
+	}
+	if _, err := q.SetDocumentCurrentVersion(ctx, sqlcgen.SetDocumentCurrentVersionParams{
+		ID:                       docID,
+		CurrentContentVersionID:  &winner.ID,
+		ExpectedContentVersionID: &original,
+	}); err != nil {
+		t.Fatalf("winner swap: %v", err)
+	}
+
+	loser, err := q.UpsertContentVersion(ctx, sqlcgen.UpsertContentVersionParams{
+		ContentHash: "cas-loser", SizeBytes: 1,
+	})
+	if err != nil {
+		t.Fatalf("loser version: %v", err)
+	}
+	_, err = q.SetDocumentCurrentVersion(ctx, sqlcgen.SetDocumentCurrentVersionParams{
+		ID:                       docID,
+		CurrentContentVersionID:  &loser.ID,
+		ExpectedContentVersionID: &original,
+	})
+	if !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("stale swap = %v, want no rows", err)
+	}
+
+	after, err := q.GetDocument(ctx, docID)
+	if err != nil {
+		t.Fatalf("re-read document: %v", err)
+	}
+	if *after.CurrentContentVersionID != winner.ID {
+		t.Errorf("document is at version %d, want the winner's %d",
+			*after.CurrentContentVersionID, winner.ID)
 	}
 }
 
@@ -703,18 +903,27 @@ func TestStaleThumbnailInvalidation(t *testing.T) {
 		t.Fatalf("new content version: %v", err)
 	}
 	if _, err := q.SetDocumentCurrentVersion(ctx, sqlcgen.SetDocumentCurrentVersionParams{
-		ID:                      docID,
-		CurrentContentVersionID: &newCV.ID,
+		ID:                       docID,
+		CurrentContentVersionID:  &newCV.ID,
+		ExpectedContentVersionID: &oldVersion,
 	}); err != nil {
 		t.Fatalf("advance current version: %v", err)
 	}
 
-	invalidated, err := q.DeleteThumbnailsForStaleContentVersion(ctx, oldVersion)
+	invalidated, err := q.MarkThumbnailsPendingDeleteForStaleContentVersion(ctx, oldVersion)
 	if err != nil {
 		t.Fatalf("targeted invalidation: %v", err)
 	}
-	if len(invalidated) != 1 || invalidated[0].ObjectKey != "thumb/old.webp" {
-		t.Fatalf("targeted invalidation returned %v", invalidated)
+	if invalidated != 1 {
+		t.Fatalf("targeted invalidation withdrew %d rows, want 1", invalidated)
+	}
+	// Withdrawn is enough to stop it being served, which is what a changed
+	// document needs before its object has gone anywhere.
+	if _, err := q.GetThumbnail(ctx, sqlcgen.GetThumbnailParams{
+		ContentVersionID: oldVersion,
+		Page:             1, Width: 320, Height: 240, Format: "webp",
+	}); !errors.Is(err, pgx.ErrNoRows) {
+		t.Errorf("a withdrawn thumbnail is still readable: %v", err)
 	}
 
 	// Now the sweep form: a tombstoned document's thumbnails must also go.
@@ -736,14 +945,36 @@ func TestStaleThumbnailInvalidation(t *testing.T) {
 		t.Fatalf("tombstone: %v", err)
 	}
 
-	swept, err := q.DeleteStaleThumbnails(ctx)
+	// The already-withdrawn row is not counted again: COALESCE keeps its
+	// original timestamp and the guard keeps it out of the result.
+	swept, err := q.MarkStaleThumbnailsPendingDelete(ctx)
 	if err != nil {
 		t.Fatalf("sweep: %v", err)
 	}
-	if len(swept) != 1 || swept[0].ObjectKey != "thumb/other.webp" {
-		t.Fatalf("sweep returned %v, want thumb/other.webp", swept)
+	if swept != 1 {
+		t.Fatalf("sweep withdrew %d rows, want only the tombstoned document's 1", swept)
 	}
 
+	pending, err := q.PendingDeleteThumbnails(ctx, 10)
+	if err != nil {
+		t.Fatalf("pending deletes: %v", err)
+	}
+	keys := make([]string, 0, len(pending))
+	for _, row := range pending {
+		keys = append(keys, row.ObjectKey)
+	}
+	slices.Sort(keys)
+	if want := []string{"thumb/old.webp", "thumb/other.webp"}; !slices.Equal(keys, want) {
+		t.Fatalf("outstanding objects = %v, want %v", keys, want)
+	}
+
+	ids := make([]int64, 0, len(pending))
+	for _, row := range pending {
+		ids = append(ids, row.ID)
+	}
+	if _, err := q.PurgeThumbnails(ctx, ids); err != nil {
+		t.Fatalf("purge: %v", err)
+	}
 	total, err := q.TotalThumbnailBytes(ctx)
 	if err != nil {
 		t.Fatalf("total bytes: %v", err)

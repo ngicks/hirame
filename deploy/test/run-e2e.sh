@@ -5,11 +5,14 @@
 #	deploy/test/run-e2e.sh --no-build   reuse the images already in the store
 #
 # On an ordinary host with systemd, this harness is not the way to test the
-# deployment: install deploy/quadlet/ under ~/.config/containers/systemd/, run
-# `systemctl --user daemon-reload`, and let systemd do what
-# lib/quadlet-supervisor.py stands in for here. It exists for the CI shape D-013
-# chose -- a container that cannot run podman directly -- and it stays the CI
-# path because it needs nothing of the host but a kernel with user namespaces.
+# deployment: install deploy/quadlet/ under the service user's
+# ~/.config/containers/systemd/ and deploy/systemd/overwatch.service under
+# /etc/systemd/system/, then run `systemctl --user daemon-reload` and `sudo
+# systemctl daemon-reload` respectively and let systemd do what
+# lib/quadlet-supervisor.py stands in for here. It exists for the CI shape
+# D-013 chose -- a container that cannot run podman directly -- and it stays
+# the CI path because it needs nothing of the host but a kernel with user
+# namespaces.
 #
 # See deploy/test/README.md for what is substituted and what is real.
 set -eu

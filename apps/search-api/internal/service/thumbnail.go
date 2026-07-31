@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"connectrpc.com/connect"
@@ -18,9 +19,14 @@ import (
 	"github.com/ngicks/hirame/apps/search-api/internal/store/sqlcgen"
 )
 
-// renderLifetime bounds a thumbnail render that outlives the request that
-// asked for it. See Thumbnail.load for why one does.
-const renderLifetime = 5 * time.Minute
+// renderLifetime bounds a thumbnail render that outlives the request that asked
+// for it. See Thumbnail.load for why one does.
+//
+// It is deliberately short. The detached render holds a slot in the thumbnail
+// render limit for its whole life, and every second past the point where the
+// waiters have gone is a slot held for nobody; a thumbnail that has not been
+// produced in two minutes is not going to be worth the wait either.
+const renderLifetime = 2 * time.Minute
 
 // ObjectStore is the thumbnail bytes' home in VersityGW. *objstore.Store
 // satisfies it.
@@ -46,26 +52,47 @@ type ThumbnailStore interface {
 // Thumbnail serves cached page previews.
 //
 // The cache invariant this type exists to hold: an object is only ever served
-// through its accounting row. Invalidation and eviction delete the row first
-// and the object second (internal/jobs), so a row that is gone means the entry
-// is gone even while its bytes linger, and an object nothing points at is
-// unreachable rather than stale. Reading the bucket directly — by guessing the
-// key, or by trusting a key without re-reading its row — would turn that
+// through its accounting row. Invalidation and eviction withdraw the row first
+// and remove the object second (internal/jobs), and a withdrawn row is one
+// GetThumbnail no longer returns — so an entry stops being servable the moment
+// it is withdrawn, even while its bytes linger, and an object nothing points at
+// is unreachable rather than stale. Reading the bucket directly — by guessing
+// the key, or by trusting a key without re-reading its row — would turn that
 // deliberate ordering into a stale-image bug.
 type Thumbnail struct {
 	store    ThumbnailStore
 	objects  ObjectStore
 	renderer PageRenderer
-	limit    *RenderLimit
+	// limit is the thumbnail render cap, separate from the full-size one. See
+	// [RenderLimit] for why the two are not shared.
+	limit *RenderLimit
 	// inflight collapses concurrent misses for one entry into one render. The
 	// alternative is a thundering herd: a search page paints twenty thumbnails
 	// at once and a shared content version would be rendered once per request.
 	inflight singleflight.Group
-	logger   *slog.Logger
+	// parties tracks who is still waiting on each in-flight render, so the
+	// render can be cancelled once nobody is. See renderParty.
+	mu      sync.Mutex
+	parties map[string]*renderParty
+	logger  *slog.Logger
 }
 
-// NewThumbnail builds the handler. limit is shared with RenderService; logger
-// must not be nil.
+// renderParty is the set of callers still waiting on one entry's render, and
+// the context the render runs on.
+//
+// The render is detached from every caller's request (see Thumbnail.load), which
+// on its own means a client that navigates away leaves a render holding a slot
+// in the limit for the rest of renderLifetime. Counting the callers is what
+// closes that: the last one to leave cancels the render, so a slot is only ever
+// held for work somebody is still waiting for.
+type renderParty struct {
+	ctx     context.Context
+	cancel  context.CancelFunc
+	waiting int
+}
+
+// NewThumbnail builds the handler. limit is this handler's own render cap, not
+// RenderService's; logger must not be nil.
 func NewThumbnail(
 	store ThumbnailStore,
 	objects ObjectStore,
@@ -78,6 +105,7 @@ func NewThumbnail(
 		objects:  objects,
 		renderer: renderer,
 		limit:    limit,
+		parties:  map[string]*renderParty{},
 		logger:   logger,
 	}
 }
@@ -128,11 +156,17 @@ func (t *Thumbnail) GetThumbnail(
 
 // load resolves one entry, rendering it if the cache cannot answer.
 //
-// The render runs on a context detached from this request. singleflight shares
-// one call's outcome with every caller waiting on it, so a leader carrying the
-// inbound context would fail all of its followers the moment its own client
-// navigated away — the followers are still waiting and their requests are still
-// live. The detached context keeps its own deadline so nothing runs unbounded.
+// The render runs on a context detached from every caller's request.
+// singleflight shares one call's outcome with everyone waiting on it, so a
+// leader carrying its own inbound context would fail all of its followers the
+// moment its client navigated away — the followers are still waiting and their
+// requests are still live. Detached, the render belongs to the party rather than
+// to whichever caller happened to start it, and it ends when the party empties
+// or renderLifetime expires, whichever comes first.
+//
+// DoChan rather than Do, because Do blocks its caller past any cancellation:
+// a client that disconnects would stay counted as a waiter, which is exactly the
+// case the party exists to notice.
 func (t *Thumbnail) load(
 	ctx context.Context,
 	row sqlcgen.GetDocumentRow,
@@ -142,12 +176,11 @@ func (t *Thumbnail) load(
 		return image, err
 	}
 
-	rendered, err, _ := t.inflight.Do(key.singleflightKey(), func() (any, error) {
-		renderCtx, cancel := context.WithTimeout(
-			context.WithoutCancel(ctx), renderLifetime,
-		)
-		defer cancel()
+	group := key.singleflightKey()
+	renderCtx, leave := t.join(ctx, group)
+	defer leave()
 
+	results := t.inflight.DoChan(group, func() (any, error) {
 		// Re-checked inside the group: a caller that queued behind the leader
 		// would otherwise render again over the entry the leader just stored.
 		if image, ok, err := t.fromCache(renderCtx, key); err != nil || ok {
@@ -155,17 +188,58 @@ func (t *Thumbnail) load(
 		}
 		return t.render(renderCtx, row, key)
 	})
-	if err != nil {
-		return nil, err
+
+	select {
+	case <-ctx.Done():
+		// This caller is gone. leave drops it from the party, and the render
+		// stops once the last one has done the same.
+		return nil, connect.NewError(connect.CodeCanceled, ctx.Err())
+	case result := <-results:
+		if result.Err != nil {
+			return nil, result.Err
+		}
+		image, ok := result.Val.([]byte)
+		if !ok {
+			return nil, connect.NewError(
+				connect.CodeInternal,
+				errors.New("thumbnail render produced no image"),
+			)
+		}
+		return image, nil
 	}
-	image, ok := rendered.([]byte)
+}
+
+// join adds this caller to the party rendering group, returning the context the
+// render runs on and the function that removes the caller again.
+//
+// The first caller in builds the context; the last one out cancels it. ctx
+// contributes its values but not its cancellation, so the render outlives any
+// single request while still ending when no request wants it.
+func (t *Thumbnail) join(ctx context.Context, group string) (context.Context, func()) {
+	t.mu.Lock()
+	party, ok := t.parties[group]
 	if !ok {
-		return nil, connect.NewError(
-			connect.CodeInternal,
-			errors.New("thumbnail render produced no image"),
+		renderCtx, cancel := context.WithTimeout(
+			context.WithoutCancel(ctx), renderLifetime,
 		)
+		party = &renderParty{ctx: renderCtx, cancel: cancel}
+		t.parties[group] = party
 	}
-	return image, nil
+	party.waiting++
+	t.mu.Unlock()
+
+	return party.ctx, func() {
+		t.mu.Lock()
+		party.waiting--
+		last := party.waiting == 0
+		if last && t.parties[group] == party {
+			delete(t.parties, group)
+		}
+		t.mu.Unlock()
+		if last {
+			party.cancel()
+		}
+	}
 }
 
 // fromCache answers from the cache, reporting whether it could.
@@ -223,12 +297,12 @@ func (t *Thumbnail) fromCache(ctx context.Context, key entry) ([]byte, bool, err
 
 // render produces an entry's bytes and publishes it to the cache.
 //
-// Object first, accounting row second — the exact reverse of the delete path,
+// Object first, accounting row second — the exact reverse of the removal path,
 // and for the same reason. The row is what makes an object reachable, so a
-// crash between the two leaves bytes nothing can resolve, which the eviction
-// sweep collects. Writing the row first would advertise an entry whose object
-// may never arrive: every later read would resolve the key, fail to fetch it,
-// and the row would keep counting against the quota.
+// crash between the two leaves bytes nothing can resolve, which the cache sweep
+// collects. Writing the row first would advertise an entry whose object may
+// never arrive: every later read would resolve the key, fail to fetch it, and
+// the row would keep counting against the quota.
 func (t *Thumbnail) render(
 	ctx context.Context,
 	row sqlcgen.GetDocumentRow,
@@ -284,13 +358,21 @@ func (t *Thumbnail) render(
 		// the stored length rather than an estimate.
 		SizeBytes: int64(image.Len()),
 	}); err != nil {
-		// The bytes are already stored and correct, so the caller is served.
-		// The row is what the eviction job accounts against, and its absence
-		// leaves the object unreachable — collected by the stale sweep rather
-		// than served to anyone.
+		// Failed rather than served. Without the row the object is unreachable
+		// and unaccounted for: it counts against nothing the quota can see, and
+		// the next request would render and store it all over again. Answering
+		// here would hide a cache that has quietly stopped caching.
+		//
+		// The object is left where it is rather than deleted: the key is
+		// derived from the content hash, so the next attempt overwrites it, and
+		// the sweep collects it if no attempt ever comes.
 		t.logger.ErrorContext(ctx, "record thumbnail accounting row",
 			slog.String("object_key", objectKey),
 			slog.Any("error", err),
+		)
+		return nil, connect.NewError(
+			connect.CodeUnavailable,
+			fmt.Errorf("record thumbnail accounting row: %w", err),
 		)
 	}
 	return image.Bytes(), nil

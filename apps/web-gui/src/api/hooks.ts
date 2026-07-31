@@ -17,7 +17,9 @@ import { currentRef } from "./refs";
 import type { DocRef } from "./refs";
 
 export const SEARCH_PAGE_SIZE = 20;
-const MAX_SNIPPETS = 3;
+// The server clamps this to 1: SearchDocuments produces one snippet per hit, so
+// asking for more only misreports what the response can contain.
+const MAX_SNIPPETS = 1;
 
 const THUMBNAIL_FORMAT = ImageFormat.WEBP;
 const THUMBNAIL_SIZE = { width: 192, height: 192 };

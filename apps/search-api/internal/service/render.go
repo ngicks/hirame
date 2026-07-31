@@ -76,19 +76,22 @@ func sourcePath(
 	return source.Path, nil
 }
 
-// RenderLimit bounds how many Gahaku streams a process holds at once.
+// RenderLimit bounds how many Gahaku streams one class of request holds at once.
 //
-// It is a shared value rather than a field each handler builds for itself,
-// because what is being limited is not either service but the renderer behind
-// both of them: Gahaku's own queue is the bottleneck, and
-// config.Concurrency.Render describes the process, not the RPC. Two private
-// semaphores of size n would let the process open 2n streams while the
-// configured knob still read n.
+// The two render paths get one each rather than sharing, because they compete
+// for the same resource on wildly different terms: a full-size render is minutes
+// long and serves one viewer, while a thumbnail is seconds long, is cached
+// afterwards, and a single search page needs twenty of them. Sharing one cap of
+// 2 meant two viewers reading documents could stop every thumbnail in the
+// deployment from being produced — and a thumbnail render survives its client
+// disconnecting (see Thumbnail.load), so those two holders need not still be
+// there. What actually caps the machine is Gahaku's own worker concurrency,
+// which is why splitting the knob here is safe.
 type RenderLimit struct {
 	streams *semaphore.Weighted
 }
 
-// NewRenderLimit builds the shared cap. n below 1 is raised to 1.
+// NewRenderLimit builds one cap. n below 1 is raised to 1.
 func NewRenderLimit(n int) *RenderLimit {
 	return &RenderLimit{streams: semaphore.NewWeighted(int64(max(n, 1)))}
 }

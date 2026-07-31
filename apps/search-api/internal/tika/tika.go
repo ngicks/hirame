@@ -17,9 +17,11 @@ import (
 	"time"
 )
 
-// ErrTooLarge reports that the document exceeded [Config.MaxBytes]. It is a
-// permanent condition: the same bytes will exceed the cap on every retry, so
-// callers should record the failure rather than schedule another attempt.
+// ErrTooLarge reports that either side of one extraction ran past its cap: the
+// document past [Config.MaxBytes], or Tika's answer past
+// [Config.MaxResponseBytes]. It is a permanent condition in both directions —
+// the same bytes produce the same size on every retry — so callers should record
+// the failure rather than schedule another attempt.
 var ErrTooLarge = errors.New("document exceeds the configured size limit")
 
 // ErrNotConfigured reports that no Tika endpoint was configured. Both binaries
@@ -34,13 +36,20 @@ type Config struct {
 	Timeout time.Duration
 	// MaxBytes caps the document size sent for extraction. 0 disables the cap.
 	MaxBytes int64
+	// MaxResponseBytes caps the extraction result read back. It is separate from
+	// MaxBytes because the two bound different risks: MaxBytes keeps this
+	// process from uploading a document too large to be worth extracting, while
+	// this keeps a server answering with something unbounded from being
+	// buffered whole. 0 disables the cap.
+	MaxResponseBytes int64
 }
 
 // Client talks to one Tika server.
 type Client struct {
-	baseURL  string
-	maxBytes int64
-	http     *http.Client
+	baseURL          string
+	maxBytes         int64
+	maxResponseBytes int64
+	http             *http.Client
 }
 
 // New builds a Client. An empty Config.BaseURL is accepted and surfaces as
@@ -53,9 +62,10 @@ func New(cfg Config) (*Client, error) {
 		}
 	}
 	return &Client{
-		baseURL:  base,
-		maxBytes: cfg.MaxBytes,
-		http:     &http.Client{Timeout: cfg.Timeout},
+		baseURL:          base,
+		maxBytes:         cfg.MaxBytes,
+		maxResponseBytes: cfg.MaxResponseBytes,
+		http:             &http.Client{Timeout: cfg.Timeout},
 	}, nil
 }
 
@@ -140,9 +150,31 @@ func (c *Client) put(
 	if resp.StatusCode != http.StatusOK {
 		return nil, &StatusError{Path: path, StatusCode: resp.StatusCode}
 	}
-	out, err := io.ReadAll(resp.Body)
+	out, err := c.readResponse(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("tika: read %s response: %w", path, err)
+	}
+	return out, nil
+}
+
+// readResponse reads the answer whole, refusing one that runs past the cap.
+//
+// Refusing rather than truncating, and wrapped in ErrTooLarge so the extraction
+// worker records it as permanent: a truncated result would be indexed as if it
+// were the document, and a response this size is a property of the bytes that
+// every retry would reproduce.
+func (c *Client) readResponse(body io.Reader) ([]byte, error) {
+	if c.maxResponseBytes <= 0 {
+		return io.ReadAll(body)
+	}
+	// One byte past the cap distinguishes "exactly at the limit" from "over it".
+	out, err := io.ReadAll(io.LimitReader(body, c.maxResponseBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(out)) > c.maxResponseBytes {
+		return nil, fmt.Errorf(
+			"%w: response exceeds the %d byte limit", ErrTooLarge, c.maxResponseBytes)
 	}
 	return out, nil
 }

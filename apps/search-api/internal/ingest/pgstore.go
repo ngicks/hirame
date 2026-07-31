@@ -344,16 +344,29 @@ func (t *pgTx) UpsertContentVersion(
 
 func (t *pgTx) SetDocumentCurrentVersion(
 	ctx context.Context,
-	documentID, contentVersionID int64,
-) error {
-	_, err := t.q.SetDocumentCurrentVersion(ctx, sqlcgen.SetDocumentCurrentVersionParams{
-		ID:                      documentID,
-		CurrentContentVersionID: &contentVersionID,
-	})
-	if err != nil {
-		return fmt.Errorf("set document %d version %d: %w", documentID, contentVersionID, err)
+	documentID, expected, contentVersionID int64,
+) (bool, error) {
+	// 0 is the package's "no version yet" sentinel and NULL is the column's, so
+	// the CAS argument has to be the pointer form rather than a zero.
+	var expectedID *int64
+	if expected != 0 {
+		expectedID = &expected
 	}
-	return nil
+	_, err := t.q.SetDocumentCurrentVersion(ctx, sqlcgen.SetDocumentCurrentVersionParams{
+		ID:                       documentID,
+		CurrentContentVersionID:  &contentVersionID,
+		ExpectedContentVersionID: expectedID,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		// No row matched: another job moved the document between the read and
+		// this write. That is the caller's signal, not a failure.
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf(
+			"set document %d version %d: %w", documentID, contentVersionID, err)
+	}
+	return true, nil
 }
 
 func (t *pgTx) MarkExtractionPending(ctx context.Context, contentVersionID int64) error {

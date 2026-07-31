@@ -1,7 +1,9 @@
 package service_test
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"connectrpc.com/connect"
@@ -212,6 +214,24 @@ func TestGetThumbnailWritesNoAccountingRowWhenTheObjectCannotBeStored(t *testing
 	}
 }
 
+// An object nothing accounts for is unreachable: it counts against no quota,
+// answers no lookup, and the next request renders and stores it all over again.
+// Serving through it would hide a cache that has stopped caching.
+func TestGetThumbnailFailsWhenTheAccountingRowCannotBeWritten(t *testing.T) {
+	store := newFakeStore()
+	store.upsertErr = errors.New("the database refused the write")
+	objects := newFakeObjects()
+	renderer := newFakeRenderer([]byte("rendered"))
+
+	_, err := getThumbnail(t, newThumbnail(store, objects, renderer), guiRequest())
+	if err == nil {
+		t.Fatal("an unrecorded thumbnail was served as success")
+	}
+	if connect.CodeOf(err) != connect.CodeUnavailable {
+		t.Errorf("code = %s, want unavailable", connect.CodeOf(err))
+	}
+}
+
 // A search page paints many thumbnails at once, and documents sharing content
 // share an entry; without suppression each request would render again.
 func TestGetThumbnailCollapsesConcurrentMissesIntoOneRender(t *testing.T) {
@@ -261,6 +281,90 @@ func TestGetThumbnailCollapsesConcurrentMissesIntoOneRender(t *testing.T) {
 		if string(results[i]) != "once" {
 			t.Errorf("caller %d got %q, want the shared render", i, results[i])
 		}
+	}
+}
+
+// The render is detached so a leader's disconnect cannot fail the followers
+// still waiting on it. Detached alone would mean a disconnecting client leaves a
+// render holding a slot in the limit for the whole of renderLifetime, which a
+// handful of them turns into a starved cache. It ends when the last caller
+// leaves instead.
+func TestGetThumbnailCancelsARenderNobodyIsWaitingForAnyMore(t *testing.T) {
+	store := newFakeStore()
+	objects := newFakeObjects()
+	renderer := newFakeRenderer([]byte("never delivered"))
+	// Held open with no release, so only cancellation can end it.
+	renderer.block = make(chan struct{})
+	renderer.released = make(chan struct{})
+	handler := newThumbnail(store, objects, renderer)
+
+	ctx, disconnect := context.WithCancel(t.Context())
+	var group errgroup.Group
+	group.Go(func() error {
+		_, err := handler.GetThumbnail(ctx, connect.NewRequest(guiRequest()))
+		if connect.CodeOf(err) != connect.CodeCanceled {
+			return fmt.Errorf("code = %s, want canceled", connect.CodeOf(err))
+		}
+		return nil
+	})
+
+	<-renderer.released
+	disconnect()
+	if err := group.Wait(); err != nil {
+		t.Fatalf("the disconnecting caller: %v", err)
+	}
+
+	// The render's own context has to be done well inside renderLifetime, which
+	// is the whole point: the next caller finds the slot free.
+	if err := renderer.awaitContextDone(t); err != nil {
+		t.Fatalf("the render outlived every caller waiting for it: %v", err)
+	}
+}
+
+// A caller that leaves while others are still waiting must not take the render
+// down with it: the rest are still holding live requests.
+func TestGetThumbnailKeepsRenderingForTheCallersStillWaiting(t *testing.T) {
+	store := newFakeStore()
+	objects := newFakeObjects()
+	renderer := newFakeRenderer([]byte("shared"))
+	renderer.block = make(chan struct{})
+	renderer.released = make(chan struct{})
+	handler := newThumbnail(store, objects, renderer)
+
+	leaving, disconnect := context.WithCancel(t.Context())
+	var group errgroup.Group
+	group.Go(func() error {
+		_, err := handler.GetThumbnail(leaving, connect.NewRequest(guiRequest()))
+		if connect.CodeOf(err) != connect.CodeCanceled {
+			return fmt.Errorf("code = %s, want canceled", connect.CodeOf(err))
+		}
+		return nil
+	})
+	<-renderer.released
+
+	stayed := make(chan []byte, 1)
+	group.Go(func() error {
+		resp, err := handler.GetThumbnail(t.Context(), connect.NewRequest(guiRequest()))
+		if err != nil {
+			return err
+		}
+		stayed <- resp.Msg.GetImage()
+		return nil
+	})
+	// Give the second caller time to join the party before the first departs.
+	waitForWaiters(t, handler, 2)
+
+	disconnect()
+	// The render is only released once the departure has actually landed, so a
+	// cancellation it should not have caused has already had its chance.
+	waitForWaiters(t, handler, 1)
+
+	close(renderer.block)
+	if err := group.Wait(); err != nil {
+		t.Fatalf("a caller failed: %v", err)
+	}
+	if got := <-stayed; string(got) != "shared" {
+		t.Errorf("the remaining caller got %q, want the render it waited for", got)
 	}
 }
 

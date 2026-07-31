@@ -17,6 +17,12 @@ are what gets exercised, minus the parts of systemd that are not being tested.
 
 What is substituted, and why it is still an honest test:
 
+  * Specifier expansion.  The deployment's units are *user* units (D-009) that
+    name %h/.config/hirame/...; quadlet passes %h through into the generated
+    ExecStart for systemd to expand at load time, and there is no systemd here,
+    so expand() does it against the same $HOME e2e.sh installed those files
+    under. An unexpanded specifier would reach podman as a relative path that
+    it creates as an empty directory -- a silent failure, not a loud one.
   * Requires= / After=.  Reimplemented here, because D-005's guarantee is
     precisely that a failed migration stops its dependents. A unit whose
     Requires= names a unit that failed or was skipped is recorded `skipped` and
@@ -60,14 +66,22 @@ DEFAULT_TIMEOUT = 90
 
 
 def generate(unit_dir):
-    """Return {service_name: {key: [values]}} from `quadlet -dryrun`.
+    """Return {service_name: {key: [values]}} from `quadlet -user -dryrun`.
 
     QUADLET_UNIT_DIRS must be absolute: the generator resolves drop-in
     directories against it and silently finds none for a relative path.
+
+    -user because the deployed units are user units (D-009). It is very nearly
+    inert here: diffing the two modes over this unit set shows the flag changes
+    only the synthesised network ordering -- Wants=/After=network-online.target
+    against podman-user-wait-network-online.service -- and neither name is a
+    unit this supervisor generates, so `order()` never sees either. It is
+    passed anyway so the generator is invoked the way the deployment invokes
+    it, rather than in a mode nothing uses.
     """
     env = dict(os.environ, QUADLET_UNIT_DIRS=os.path.abspath(unit_dir))
     proc = subprocess.run(
-        [QUADLET, "-dryrun", "-no-kmsg-log"],
+        [QUADLET, "-user", "-dryrun", "-no-kmsg-log"],
         env=env,
         capture_output=True,
         text=True,
@@ -102,10 +116,16 @@ def parse(name, lines):
 def expand(value, unit_name):
     """The systemd specifiers quadlet emits, plus the C-escapes it applies.
 
-    %h matters most: nine of the deployment's units name their environment
-    files and the watched documents tree as %h/..., and an unexpanded one
-    reaches podman as a literal relative path that it then creates as an empty
-    directory.
+    %h matters most, and is the reason this function exists: the deployment's
+    units are *user* units (D-009) that name their environment files and
+    postgresql.conf as %h/.config/hirame/..., and quadlet deliberately passes
+    %h through into the generated ExecStart for systemd to expand at load time.
+    There is no systemd here to do that, so an unexpanded one would reach
+    podman as a literal relative path that it then creates as an empty
+    directory -- a silent failure, not a loud one.
+
+    %t is load-bearing too (quadlet emits RequiresMountsFor=%t/containers
+    itself). The rest are kept for the same silent-failure reason.
     """
     stem = unit_name.rsplit(".", 1)[0]
     home = os.path.expanduser("~")

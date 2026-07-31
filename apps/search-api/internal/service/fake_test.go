@@ -15,6 +15,7 @@ import (
 
 	"github.com/ngicks/hirame/apps/search-api/internal/gahakuclient"
 	"github.com/ngicks/hirame/apps/search-api/internal/objstore"
+	"github.com/ngicks/hirame/apps/search-api/internal/service"
 	"github.com/ngicks/hirame/apps/search-api/internal/store/sqlcgen"
 )
 
@@ -78,6 +79,9 @@ type fakeStore struct {
 	upserts    []sqlcgen.UpsertThumbnailParams
 	touched    []int64
 	nextID     int64
+	// upsertErr fails every accounting write, which is a cache that has quietly
+	// stopped caching rather than something to serve through.
+	upsertErr error
 }
 
 func newFakeStore() *fakeStore {
@@ -167,6 +171,9 @@ func (f *fakeStore) UpsertThumbnail(
 ) (sqlcgen.ThumbnailCache, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.upsertErr != nil {
+		return sqlcgen.ThumbnailCache{}, f.upsertErr
+	}
 	f.upserts = append(f.upserts, arg)
 	row := sqlcgen.ThumbnailCache{
 		ID:               f.nextID,
@@ -277,8 +284,14 @@ type fakeRenderer struct {
 	err      error
 	calls    []gahakuclient.PageRequest
 	released chan struct{}
+	// releasedOnce closes released exactly once. The field itself is read by the
+	// test goroutine while a render is in flight, so it must not be reassigned.
+	releasedOnce sync.Once
 	// block holds a render open so a test can observe two callers colliding.
 	block chan struct{}
+	// renderCtx is the context the handler ran the render on, kept so a test can
+	// watch it end.
+	renderCtx context.Context
 }
 
 func newFakeRenderer(chunks ...[]byte) *fakeRenderer {
@@ -290,15 +303,13 @@ func (r *fakeRenderer) RenderPage(
 ) error {
 	r.mu.Lock()
 	r.calls = append(r.calls, req)
+	r.renderCtx = ctx
 	block, released, err := r.block, r.released, r.err
 	chunks := r.chunks
 	r.mu.Unlock()
 
 	if released != nil {
-		close(released)
-		r.mu.Lock()
-		r.released = nil
-		r.mu.Unlock()
+		r.releasedOnce.Do(func() { close(released) })
 	}
 	if block != nil {
 		select {
@@ -322,6 +333,38 @@ func (r *fakeRenderer) callCount() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return len(r.calls)
+}
+
+// awaitContextDone waits for the context the render is running on to end. The
+// bound is far below renderLifetime, so passing means the render was cancelled
+// rather than merely destined to time out eventually.
+func (r *fakeRenderer) awaitContextDone(t *testing.T) error {
+	t.Helper()
+	r.mu.Lock()
+	ctx := r.renderCtx
+	r.mu.Unlock()
+	if ctx == nil {
+		t.Fatal("the renderer was never called")
+	}
+	select {
+	case <-ctx.Done():
+		return nil
+	case <-time.After(2 * time.Second):
+		return errors.New("the render context is still live")
+	}
+}
+
+// waitForWaiters blocks until n callers are waiting on a render, so a test can
+// arrange one departure against another caller that is definitely still there.
+func waitForWaiters(t *testing.T, handler *service.Thumbnail, n int) {
+	t.Helper()
+	for range 200 {
+		if handler.WaitingOn() == n {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("only %d callers are waiting, want %d", handler.WaitingOn(), n)
 }
 
 func (r *fakeRenderer) lastCall(t *testing.T) gahakuclient.PageRequest {

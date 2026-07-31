@@ -11,126 +11,14 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const deleteStaleThumbnails = `-- name: DeleteStaleThumbnails :many
-DELETE FROM thumbnail_cache tc
-WHERE NOT EXISTS (
-    SELECT 1 FROM documents d
-    WHERE d.current_content_version_id = tc.content_version_id
-      AND d.deleted_at IS NULL
-)
-RETURNING tc.id, tc.object_key, tc.size_bytes
-`
-
-type DeleteStaleThumbnailsRow struct {
-	ID        int64
-	ObjectKey string
-	SizeBytes int64
-}
-
-// DeleteStaleThumbnails drops accounting for every content version that is no
-// longer any live document's current version: the modified-document case and
-// the tombstoned-document case are the same query, because both stop the
-// version from being current.
-func (q *Queries) DeleteStaleThumbnails(ctx context.Context) ([]DeleteStaleThumbnailsRow, error) {
-	rows, err := q.db.Query(ctx, deleteStaleThumbnails)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var items []DeleteStaleThumbnailsRow
-	for rows.Next() {
-		var i DeleteStaleThumbnailsRow
-		if err := rows.Scan(&i.ID, &i.ObjectKey, &i.SizeBytes); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const deleteThumbnails = `-- name: DeleteThumbnails :many
-DELETE FROM thumbnail_cache WHERE id = ANY($1::bigint[])
-RETURNING id, object_key, size_bytes
-`
-
-type DeleteThumbnailsRow struct {
-	ID        int64
-	ObjectKey string
-	SizeBytes int64
-}
-
-func (q *Queries) DeleteThumbnails(ctx context.Context, ids []int64) ([]DeleteThumbnailsRow, error) {
-	rows, err := q.db.Query(ctx, deleteThumbnails, ids)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var items []DeleteThumbnailsRow
-	for rows.Next() {
-		var i DeleteThumbnailsRow
-		if err := rows.Scan(&i.ID, &i.ObjectKey, &i.SizeBytes); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const deleteThumbnailsForStaleContentVersion = `-- name: DeleteThumbnailsForStaleContentVersion :many
-DELETE FROM thumbnail_cache tc
-WHERE tc.content_version_id = $1
-  AND NOT EXISTS (
-      SELECT 1 FROM documents d
-      WHERE d.current_content_version_id = tc.content_version_id
-        AND d.deleted_at IS NULL
-  )
-RETURNING tc.id, tc.object_key, tc.size_bytes
-`
-
-type DeleteThumbnailsForStaleContentVersionRow struct {
-	ID        int64
-	ObjectKey string
-	SizeBytes int64
-}
-
-// DeleteThumbnailsForStaleContentVersion is the targeted form, run on the
-// ingestion path with the version a document just stopped pointing at, so a
-// changed document cannot serve a stale thumbnail before the sweep runs. The
-// NOT EXISTS guard keeps it from evicting a version another live document still
-// holds, which deduplicated content makes possible.
-func (q *Queries) DeleteThumbnailsForStaleContentVersion(ctx context.Context, contentVersionID int64) ([]DeleteThumbnailsForStaleContentVersionRow, error) {
-	rows, err := q.db.Query(ctx, deleteThumbnailsForStaleContentVersion, contentVersionID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var items []DeleteThumbnailsForStaleContentVersionRow
-	for rows.Next() {
-		var i DeleteThumbnailsForStaleContentVersionRow
-		if err := rows.Scan(&i.ID, &i.ObjectKey, &i.SizeBytes); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
 const getThumbnail = `-- name: GetThumbnail :one
-SELECT id, content_version_id, page, width, height, format, object_key, size_bytes, created_at, last_access_at FROM thumbnail_cache
+SELECT id, content_version_id, page, width, height, format, object_key, size_bytes, created_at, last_access_at, pending_delete_at FROM thumbnail_cache
 WHERE content_version_id = $1
   AND page = $2
   AND width = $3
   AND height = $4
   AND format = $5
+  AND pending_delete_at IS NULL
 `
 
 type GetThumbnailParams struct {
@@ -161,14 +49,164 @@ func (q *Queries) GetThumbnail(ctx context.Context, arg GetThumbnailParams) (Thu
 		&i.SizeBytes,
 		&i.CreatedAt,
 		&i.LastAccessAt,
+		&i.PendingDeleteAt,
 	)
 	return i, err
+}
+
+const markStaleThumbnailsPendingDelete = `-- name: MarkStaleThumbnailsPendingDelete :execrows
+UPDATE thumbnail_cache tc
+SET pending_delete_at = COALESCE(tc.pending_delete_at, now())
+WHERE tc.pending_delete_at IS NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM documents d
+      WHERE d.current_content_version_id = tc.content_version_id
+        AND d.deleted_at IS NULL
+  )
+`
+
+// MarkStaleThumbnailsPendingDelete withdraws accounting for every content
+// version that is no longer any live document's current version: the
+// modified-document case and the tombstoned-document case are the same query,
+// because both stop the version from being current. It is the periodic backstop
+// behind the targeted form below.
+func (q *Queries) MarkStaleThumbnailsPendingDelete(ctx context.Context) (int64, error) {
+	result, err := q.db.Exec(ctx, markStaleThumbnailsPendingDelete)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const markThumbnailsPendingDelete = `-- name: MarkThumbnailsPendingDelete :execrows
+UPDATE thumbnail_cache
+SET pending_delete_at = COALESCE(pending_delete_at, now())
+WHERE id = ANY($1::bigint[])
+`
+
+// MarkThumbnailsPendingDelete withdraws rows the eviction passes chose. The
+// timestamp is preserved on a row already marked so the drain order stays the
+// age of the withdrawal rather than the age of the last pass over it.
+func (q *Queries) MarkThumbnailsPendingDelete(ctx context.Context, ids []int64) (int64, error) {
+	result, err := q.db.Exec(ctx, markThumbnailsPendingDelete, ids)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const markThumbnailsPendingDeleteForStaleContentVersion = `-- name: MarkThumbnailsPendingDeleteForStaleContentVersion :execrows
+UPDATE thumbnail_cache tc
+SET pending_delete_at = COALESCE(tc.pending_delete_at, now())
+WHERE tc.content_version_id = $1
+  AND tc.pending_delete_at IS NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM documents d
+      WHERE d.current_content_version_id = tc.content_version_id
+        AND d.deleted_at IS NULL
+  )
+`
+
+// MarkThumbnailsPendingDeleteForStaleContentVersion is the targeted form, run on
+// the ingestion path with the version a document just stopped pointing at, so a
+// changed document cannot serve a stale thumbnail before the sweep runs. The
+// NOT EXISTS guard keeps it from withdrawing a version another live document
+// still holds, which deduplicated content makes possible.
+func (q *Queries) MarkThumbnailsPendingDeleteForStaleContentVersion(ctx context.Context, contentVersionID int64) (int64, error) {
+	result, err := q.db.Exec(ctx, markThumbnailsPendingDeleteForStaleContentVersion, contentVersionID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const pendingDeleteThumbnails = `-- name: PendingDeleteThumbnails :many
+SELECT id, object_key, size_bytes FROM thumbnail_cache
+WHERE pending_delete_at IS NOT NULL
+ORDER BY pending_delete_at, id
+LIMIT $1
+`
+
+type PendingDeleteThumbnailsRow struct {
+	ID        int64
+	ObjectKey string
+	SizeBytes int64
+}
+
+// PendingDeleteThumbnails is the drain's work list, and the only place any
+// caller learns which objects are still outstanding.
+func (q *Queries) PendingDeleteThumbnails(ctx context.Context, resultLimit int32) ([]PendingDeleteThumbnailsRow, error) {
+	rows, err := q.db.Query(ctx, pendingDeleteThumbnails, resultLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []PendingDeleteThumbnailsRow
+	for rows.Next() {
+		var i PendingDeleteThumbnailsRow
+		if err := rows.Scan(&i.ID, &i.ObjectKey, &i.SizeBytes); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const purgeThumbnails = `-- name: PurgeThumbnails :execrows
+DELETE FROM thumbnail_cache
+WHERE id = ANY($1::bigint[]) AND pending_delete_at IS NOT NULL
+`
+
+// PurgeThumbnails drops rows whose objects are gone. The pending_delete_at
+// guard is what keeps a concurrent re-render safe: UpsertThumbnail clears the
+// mark, so an entry republished while the drain was running is no longer
+// matched here.
+func (q *Queries) PurgeThumbnails(ctx context.Context, ids []int64) (int64, error) {
+	result, err := q.db.Exec(ctx, purgeThumbnails, ids)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const referencedThumbnailObjectKeys = `-- name: ReferencedThumbnailObjectKeys :many
+SELECT object_key FROM thumbnail_cache
+WHERE object_key = ANY($1::text[])
+`
+
+// ReferencedThumbnailObjectKeys answers "which of these keys does accounting
+// still know about", asked one listing page at a time. A key absent from the
+// answer is an object no row can reach, which is what the orphan sweep removes.
+// Rows marked pending_delete_at count as referencing their object: the drain
+// owns those, and removing them here would race it.
+func (q *Queries) ReferencedThumbnailObjectKeys(ctx context.Context, objectKeys []string) ([]string, error) {
+	rows, err := q.db.Query(ctx, referencedThumbnailObjectKeys, objectKeys)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var object_key string
+		if err := rows.Scan(&object_key); err != nil {
+			return nil, err
+		}
+		items = append(items, object_key)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const thumbnailEvictionCandidatesByAge = `-- name: ThumbnailEvictionCandidatesByAge :many
 SELECT id, object_key, size_bytes, created_at, last_access_at
 FROM thumbnail_cache
 WHERE created_at < $1
+  AND pending_delete_at IS NULL
 ORDER BY created_at
 LIMIT $2
 `
@@ -186,6 +224,9 @@ type ThumbnailEvictionCandidatesByAgeRow struct {
 	LastAccessAt pgtype.Timestamptz
 }
 
+// The eviction candidate queries consider live entries only. A withdrawn row is
+// already accounted for by the drain, and offering it again would let one pass
+// choose it twice.
 func (q *Queries) ThumbnailEvictionCandidatesByAge(ctx context.Context, arg ThumbnailEvictionCandidatesByAgeParams) ([]ThumbnailEvictionCandidatesByAgeRow, error) {
 	rows, err := q.db.Query(ctx, thumbnailEvictionCandidatesByAge, arg.OlderThan, arg.ResultLimit)
 	if err != nil {
@@ -221,12 +262,15 @@ SELECT
         SELECT COALESCE(sum(t2.size_bytes), 0)
         FROM thumbnail_cache t2
         WHERE (t2.last_access_at, t2.id) >= (t.last_access_at, t.id)
+          AND t2.pending_delete_at IS NULL
     )::bigint AS running_bytes
 FROM thumbnail_cache t
-WHERE (
+WHERE t.pending_delete_at IS NULL
+  AND (
     SELECT COALESCE(sum(t2.size_bytes), 0)
     FROM thumbnail_cache t2
     WHERE (t2.last_access_at, t2.id) >= (t.last_access_at, t.id)
+      AND t2.pending_delete_at IS NULL
 ) > $1
 ORDER BY t.last_access_at ASC, t.id ASC
 `
@@ -302,10 +346,11 @@ INSERT INTO thumbnail_cache (
     $1, $2, $3, $4, $5, $6, $7
 )
 ON CONFLICT (content_version_id, page, width, height, format) DO UPDATE SET
-    object_key     = EXCLUDED.object_key,
-    size_bytes     = EXCLUDED.size_bytes,
-    last_access_at = now()
-RETURNING id, content_version_id, page, width, height, format, object_key, size_bytes, created_at, last_access_at
+    object_key        = EXCLUDED.object_key,
+    size_bytes        = EXCLUDED.size_bytes,
+    last_access_at    = now(),
+    pending_delete_at = NULL
+RETURNING id, content_version_id, page, width, height, format, object_key, size_bytes, created_at, last_access_at, pending_delete_at
 `
 
 type UpsertThumbnailParams struct {
@@ -318,8 +363,17 @@ type UpsertThumbnailParams struct {
 	SizeBytes        int64
 }
 
-// Thumbnail cache accounting (D-008). Rows here describe objects in VersityGW;
-// every delete returns the object keys the caller still has to remove there.
+// Thumbnail cache accounting (D-008). Rows here describe objects in VersityGW.
+//
+// Removal is two-phase, because the row and the bytes live in different stores
+// and no transaction spans both. A row is first marked pending_delete_at, which
+// withdraws it from every read; only once its object is gone is the row purged.
+// The marked rows are therefore the durable list of outstanding object deletes,
+// which is what makes a retried job re-derive exactly the work left over rather
+// than find nothing and report success.
+// UpsertThumbnail clears pending_delete_at: a re-render publishes fresh bytes at
+// the same deterministic key, so the entry is live again and must not be purged
+// by a drain still holding the old id.
 func (q *Queries) UpsertThumbnail(ctx context.Context, arg UpsertThumbnailParams) (ThumbnailCache, error) {
 	row := q.db.QueryRow(ctx, upsertThumbnail,
 		arg.ContentVersionID,
@@ -342,6 +396,7 @@ func (q *Queries) UpsertThumbnail(ctx context.Context, arg UpsertThumbnailParams
 		&i.SizeBytes,
 		&i.CreatedAt,
 		&i.LastAccessAt,
+		&i.PendingDeleteAt,
 	)
 	return i, err
 }

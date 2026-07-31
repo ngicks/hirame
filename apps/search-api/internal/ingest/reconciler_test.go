@@ -3,6 +3,7 @@ package ingest_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log/slog"
 	"strings"
 	"testing"
@@ -142,7 +143,7 @@ func TestDuplicateEventIsDroppedByTheWatermark(t *testing.T) {
 func TestDeleteTombstonesTheDocumentAndInvalidatesItsThumbnails(t *testing.T) {
 	store := newFakeStore()
 	doc, _ := store.tx.CreateDocument(t.Context(), 1, testRoot+"/a.pdf", 64, 100)
-	_ = store.tx.SetDocumentCurrentVersion(t.Context(), doc.ID, 7)
+	store.tx.setVersion(doc.ID, 7)
 	_ = store.tx.UpsertObservation(t.Context(), ingest.Observation{
 		MountpointID: 1, Path: testRoot + "/a.pdf",
 	})
@@ -166,7 +167,7 @@ func TestDeleteTombstonesTheDocumentAndInvalidatesItsThumbnails(t *testing.T) {
 func TestDeletingADirectoryTombstonesEverythingBeneathIt(t *testing.T) {
 	store := newFakeStore()
 	inner, _ := store.tx.CreateDocument(t.Context(), 1, testRoot+"/sub/a.pdf", 64, 100)
-	_ = store.tx.SetDocumentCurrentVersion(t.Context(), inner.ID, 9)
+	store.tx.setVersion(inner.ID, 9)
 	outside, _ := store.tx.CreateDocument(t.Context(), 1, testRoot+"/other.pdf", 64, 101)
 
 	applyAll(t, store, []*overwatchv1.SubscribeResponse{
@@ -209,7 +210,7 @@ func TestRenameKeepsDocumentIdentity(t *testing.T) {
 func TestRenamingToAnExcludedNameTombstonesTheDocument(t *testing.T) {
 	store := newFakeStore()
 	doc, _ := store.tx.CreateDocument(t.Context(), 1, testRoot+"/report.pdf", 64, 100)
-	_ = store.tx.SetDocumentCurrentVersion(t.Context(), doc.ID, 3)
+	store.tx.setVersion(doc.ID, 3)
 
 	applyAll(t, store, []*overwatchv1.SubscribeResponse{
 		moveEvent(1, testRoot+"/report.pdf", testRoot+"/report.pdf.bak", false, stat(10, 100)),
@@ -232,7 +233,7 @@ func TestRenamingToAnExcludedNameTombstonesTheDocument(t *testing.T) {
 func TestWriteToTempThenRenameKeepsTheDestinationDocument(t *testing.T) {
 	store := newFakeStore()
 	doc, _ := store.tx.CreateDocument(t.Context(), 1, testRoot+"/report.pdf", 64, 100)
-	_ = store.tx.SetDocumentCurrentVersion(t.Context(), doc.ID, 3)
+	store.tx.setVersion(doc.ID, 3)
 	_ = store.tx.UpsertObservation(t.Context(), ingest.Observation{
 		MountpointID: 1, Path: testRoot + "/report.pdf", Ino: 100, Dev: 64,
 	})
@@ -260,7 +261,7 @@ func TestRenamingOverAnExistingDocumentTombstonesTheOverwrittenOne(t *testing.T)
 	store := newFakeStore()
 	source, _ := store.tx.CreateDocument(t.Context(), 1, testRoot+"/new.pdf", 64, 100)
 	victim, _ := store.tx.CreateDocument(t.Context(), 1, testRoot+"/old.pdf", 64, 101)
-	_ = store.tx.SetDocumentCurrentVersion(t.Context(), victim.ID, 5)
+	store.tx.setVersion(victim.ID, 5)
 
 	applyAll(t, store, []*overwatchv1.SubscribeResponse{
 		moveEvent(1, testRoot+"/new.pdf", testRoot+"/old.pdf", false, stat(10, 100)),
@@ -280,7 +281,7 @@ func TestRenamingOverAnExistingDocumentTombstonesTheOverwrittenOne(t *testing.T)
 func TestRenamingADirectoryRepathsItsContentsWithoutReExtraction(t *testing.T) {
 	store := newFakeStore()
 	doc, _ := store.tx.CreateDocument(t.Context(), 1, testRoot+"/old/a.pdf", 64, 100)
-	_ = store.tx.SetDocumentCurrentVersion(t.Context(), doc.ID, 4)
+	store.tx.setVersion(doc.ID, 4)
 	_ = store.tx.UpsertObservation(t.Context(), ingest.Observation{
 		MountpointID: 1, Path: testRoot + "/old/a.pdf",
 	})
@@ -310,7 +311,7 @@ func TestRenamingADirectoryRepathsItsContentsWithoutReExtraction(t *testing.T) {
 func TestMovingOutOfEveryWatchedRootIsADeletion(t *testing.T) {
 	store := newFakeStore()
 	doc, _ := store.tx.CreateDocument(t.Context(), 1, testRoot+"/a.pdf", 64, 100)
-	_ = store.tx.SetDocumentCurrentVersion(t.Context(), doc.ID, 2)
+	store.tx.setVersion(doc.ID, 2)
 
 	applyAll(t, store, []*overwatchv1.SubscribeResponse{
 		moveEvent(1, testRoot+"/a.pdf", "/elsewhere/a.pdf", false, stat(10, 100)),
@@ -327,7 +328,7 @@ func TestGapTriggersARescanThatSweepsMissedDeletes(t *testing.T) {
 	// the rescan runs.
 	survivor, _ := store.tx.CreateDocument(t.Context(), 1, testRoot+"/kept.pdf", 64, 100)
 	vanished, _ := store.tx.CreateDocument(t.Context(), 1, testRoot+"/gone.pdf", 64, 101)
-	_ = store.tx.SetDocumentCurrentVersion(t.Context(), vanished.ID, 8)
+	store.tx.setVersion(vanished.ID, 8)
 	for _, p := range []string{testRoot + "/kept.pdf", testRoot + "/gone.pdf"} {
 		_ = store.tx.UpsertObservation(t.Context(), ingest.Observation{
 			MountpointID: 1, Path: p, Size: 10, Mtime: testMtime,
@@ -366,7 +367,7 @@ func TestGapTriggersARescanThatSweepsMissedDeletes(t *testing.T) {
 func TestRescanOnlyQueuesFilesItCannotAccountFor(t *testing.T) {
 	store := newFakeStore()
 	unchanged, _ := store.tx.CreateDocument(t.Context(), 1, testRoot+"/same.pdf", 64, 100)
-	_ = store.tx.SetDocumentCurrentVersion(t.Context(), unchanged.ID, 1)
+	store.tx.setVersion(unchanged.ID, 1)
 	for _, p := range []string{testRoot + "/same.pdf", testRoot + "/grown.pdf"} {
 		_ = store.tx.UpsertObservation(t.Context(), ingest.Observation{
 			MountpointID: 1, Path: p, Size: 10, Mtime: testMtime,
@@ -418,6 +419,95 @@ func TestBootstrapScanRunsWhenTheStoreHasNeverBeenReconciled(t *testing.T) {
 	requireIngestQueued(t, store.tx.queuedIngest, testRoot+"/a.pdf")
 	if store.tx.watermark != 3 {
 		t.Errorf("watermark = %d, want the ring head captured before the scan", store.tx.watermark)
+	}
+}
+
+// Nested mountpoints are supported, and mountpointFor resolves a path to the
+// deepest root containing it. A scan of the outer root also walks the inner one,
+// so its paths have to be recorded under the inner mountpoint exactly as every
+// event path is; taking the scanned root's id instead gives one file two
+// identities, and each root's epoch sweep then reads the other's rows as
+// unobserved.
+func TestAScanOfAnOuterRootRecordsNestedPathsUnderTheNestedMountpoint(t *testing.T) {
+	const nestedRoot = testRoot + "/nested"
+	store := newFakeStore()
+	watcher := &fakeWatcher{
+		head: 3,
+		scanned: map[string][]*overwatchv1.Observation{
+			testRoot: {
+				observation(testRoot+"/outer.pdf", 10, 100),
+				observation(nestedRoot+"/inner.pdf", 20, 101),
+			},
+			nestedRoot: {observation(nestedRoot+"/inner.pdf", 20, 101)},
+		},
+	}
+	r := ingest.New(
+		watcher,
+		store,
+		doctype.NewFilter(nil),
+		[]ingest.Mountpoint{{ID: 1, Root: testRoot}, {ID: 2, Root: nestedRoot}},
+		discardLogger(),
+		time.Millisecond,
+	)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	watcher.onResubscribe = cancel
+	if err := r.Run(ctx); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	obs, ok := store.tx.observations[key(2, nestedRoot+"/inner.pdf")]
+	if !ok {
+		t.Fatalf("nested path not recorded under mountpoint 2; observations = %v",
+			store.tx.observations)
+	}
+	if obs.MountpointID != 2 {
+		t.Errorf("observation mountpoint = %d, want the nested root's 2", obs.MountpointID)
+	}
+	if _, wrong := store.tx.observations[key(1, nestedRoot+"/inner.pdf")]; wrong {
+		t.Error("the nested path was also recorded under the outer mountpoint")
+	}
+	for _, call := range store.tx.queuedIngest {
+		if call.Path == nestedRoot+"/inner.pdf" && call.MountpointID != 2 {
+			t.Errorf("queued %s under mountpoint %d, want the nested root's 2",
+				call.Path, call.MountpointID)
+		}
+	}
+}
+
+// The watermark is one process-wide value, and runOnce only bootstraps while it
+// is zero. Committing it inside the first root's transaction would let a failure
+// on a later root leave it set with that root never scanned — a bootstrap that
+// can never happen again.
+func TestAFailedRootLeavesTheBootstrapWatermarkUnset(t *testing.T) {
+	const secondRoot = "/srv/scans"
+	store := newFakeStore()
+	watcher := &fakeWatcher{
+		head: 7,
+		scanned: map[string][]*overwatchv1.Observation{
+			testRoot: {observation(testRoot+"/a.pdf", 10, 100)},
+		},
+		scanErr: map[string]error{secondRoot: errors.New("daemon lost the root")},
+	}
+	r := ingest.New(
+		watcher,
+		store,
+		doctype.NewFilter(nil),
+		[]ingest.Mountpoint{{ID: 1, Root: testRoot}, {ID: 2, Root: secondRoot}},
+		discardLogger(),
+		time.Millisecond,
+	)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := r.Run(ctx); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	if store.tx.watermark != 0 {
+		t.Errorf("watermark = %d, want 0: a root was never scanned, so the next "+
+			"start has to bootstrap again", store.tx.watermark)
 	}
 }
 

@@ -17,12 +17,14 @@ so a change to the deployment cannot be papered over here.
 ## Why this shape
 
 D-013 chose podman-in-podman over a KVM guest, and this execution environment
-turns out not to allow even the ordinary rootless arrangement. **On a normal
-host with systemd none of this is needed**: install `deploy/quadlet/` under
-`~/.config/containers/systemd/`, run `systemctl --user daemon-reload`, and
-systemd generates and supervises the same services. This harness exists for the
-CI shape, and it stays the CI path because it needs nothing of the host but a
-kernel with unprivileged user namespaces.
+turns out not to allow even an ordinary rootless arrangement. **On a normal host
+with systemd none of this is needed**: install `deploy/quadlet/` under the
+service user's `~/.config/containers/systemd/` and
+`deploy/systemd/overwatch.service` under `/etc/systemd/system/`, run `systemctl
+--user daemon-reload` and `sudo systemctl daemon-reload`, and systemd generates
+and supervises the same services. This harness exists for the CI shape, and it
+stays the CI path because it needs nothing of the host but a kernel with
+unprivileged user namespaces.
 
 Four environment constraints shape everything below. Each was measured, not
 assumed.
@@ -33,6 +35,21 @@ assumed.
 | `iptables` and `nft` are both absent | netavark cannot program a bridge at any depth, so every container runs `--network=host` and `env/` addresses services as `127.0.0.1` |
 | `/sys/fs/cgroup` is a read-only, threaded cgroup2 tree | systemd cannot run (not even as PID 1), every container needs `--cgroups=disabled`, and `podman pod create` fails outright |
 | `sethostname(2)` is seccomp-blocked | every container needs `--uts=host`, and `podman build` needs `--isolation=chroot` |
+
+Prerequisites on the host running the harness: podman (vendored under
+`PODMAN_DIST`), `gcc` for `lib/*.c`, `python3` for the supervisor, and **`go`**,
+which `build-images.sh` needs for the two overwatch binaries — those are host
+binaries rather than images now, so they cannot carry their own toolchain in a
+build stage.
+
+The harness writes to the paths the deployment names, and reproduces its split
+between the two privilege domains (D-009): `$HOME/.config/hirame/` for the user
+units' configuration — which is what their `%h/.config/hirame/...` expands to —
+plus `/etc/hirame/overwatch.json` for the system daemon, `/srv/documents` for
+the watched tree, and `/run/overwatch/hirame/` for the socket. Inside
+`pnp-enter` those are the nested namespace's own and `$HOME` is `/root`, so the
+supervisor's `%h` expansion is what makes the user paths land; the watched tree
+is a tmpfs of its own.
 
 **One `pnp-enter` per run.** There is no `nsenter` here and a second
 `pnp-enter` is a *different* user namespace, so a stack started in one
@@ -47,7 +64,7 @@ invocation only because images live in the shared graphroot and survive it.
 | `run-e2e.sh` | the entrypoint; builds, then runs `e2e.sh` inside `pnp-enter` |
 | `e2e.sh` | setup, the fixtures, the assertion helpers, and the summary table |
 | `scenarios/s*.sh` | one function per scenario, sourced by `e2e.sh` |
-| `build-images.sh` | builds the four `localhost/` images plus the stand-in daemon |
+| `build-images.sh` | builds the three `localhost/` images, plus `bin/overwatch` and `bin/fakeoverwatch` |
 | `lib/pnp-enter`, `lib/userns-exec.c`, `lib/pnp-mount.c` | the nested user namespace and the mounts inside it |
 | `lib/pnp-lib.sh` | `pnp_scratch`, `pnp_volume_tmpfs`, `pnp_require_port`, `wait_for` |
 | `lib/quadlet-supervisor.py` | runs podman's Quadlet generator and executes what it emits |
@@ -56,12 +73,21 @@ invocation only because images live in the shared graphroot and survive it.
 | `dropins-eviction-quota/` | S8's one-byte cache quota, applied on top of `dropins/` |
 | `env/` | concrete `hirame.env` / `secrets.env` for the test profile |
 | `fakeoverwatch/` | the stand-in overwatch daemon (its own Go module; build it with `GOWORK=off`) |
+| `bin/` | the two compiled daemons, gitignored |
 
 ## What is substituted, and what stays real
 
-`lib/quadlet-supervisor.py` runs the real Quadlet generator and executes the
-`ExecStart` lines it emits, in `After=` order. It substitutes exactly two
-things systemd would otherwise provide:
+`lib/quadlet-supervisor.py` runs the real Quadlet generator — with `-user`,
+because the deployed units are user units — and executes the `ExecStart` lines
+it emits, in `After=` order. It substitutes three things systemd would otherwise
+provide:
+
+- **Specifier expansion.** Quadlet passes `%h` through into the generated
+  `ExecStart=` for systemd to expand at load time, and there is no systemd here,
+  so `expand()` does it. This is what puts the units' `%h/.config/hirame/...`
+  onto the same files `e2e.sh` installed. An unexpanded `%h` would reach podman
+  as a relative path that it creates as an empty directory, which is why the
+  validation below greps the supervisor's `print` output for a leftover `%`.
 
 - **`Requires=` / `After=`.** Reimplemented, because D-005's guarantee *is*
   that a failed migration stops its dependents. A unit whose `Requires=` names
@@ -73,6 +99,11 @@ things systemd would otherwise provide:
   by running the unit's own `HealthCmd=` through `podman healthcheck run` until
   it passes. The probe is the deployed one; only the thing that waits on it
   changed.
+
+`e2e.sh` substitutes one thing more, outside the supervisor:
+`deploy/systemd/overwatch.service`, whose `RuntimeDirectory=` and `ExecStart=`
+it performs by hand around the stand-in binary. That unit is not a Quadlet unit,
+so the generator never sees it.
 
 A `Requires=` target the supervisor has never been asked to start counts as
 satisfied — only `failed` and `skipped` block a dependent. S2 is unaffected
@@ -96,7 +127,14 @@ cleared without touching a unit.
 | --- | --- | --- |
 | every container | `Network=host`, `PodmanArgs=--uts=host --cgroups=disabled` | no iptables, seccomp, read-only cgroups (table above) |
 | `search-api`, `indexer`, `web-gui`, `hirame-migrate` | `Pod=` cleared | `podman pod create` always makes a pod cgroup, and the cgroup tree is read-only |
-| `overwatch` | `Image=localhost/hirame-fake-overwatch:latest` | fanotify needs initial-userns `CAP_SYS_ADMIN` (below) |
+
+There is no drop-in for overwatch any more: it is not a Quadlet unit, so there
+is no `Image=` to override, and `indexer.container` no longer names it in
+`After=` either — a user unit cannot order against a system unit, so that edge
+does not exist in the deployment to reproduce. What is exercised exactly as
+deployed is the mount, `Volume=/run/overwatch/hirame:/run/overwatch/hirame:ro`,
+against a directory `e2e.sh` creates before the container starts, which is what
+the deployment gets from `RuntimeDirectory=` and its `tmpfiles.d` entry.
 
 Dropping the pod costs nothing the pod was carrying here: host networking gives
 search-api on `127.0.0.1:8081` reachable from the Caddy container over
@@ -115,16 +153,26 @@ restarts against.
 
 ### The stand-in overwatch daemon (`fakeoverwatch/`)
 
-`run-e2e.sh` builds `localhost/hirame-overwatch:latest` from the real
-`deploy/overwatch/Containerfile` and tries to start it first, recording
-verbatim what it says. It cannot work: fanotify filesystem marks require
-`CAP_SYS_ADMIN` in the **initial** user namespace, which no nesting depth can
-supply.
+The deployment runs overwatch as a native systemd service (D-009), so the
+harness runs its stand-in the same way: a plain background process inside the
+`pnp-enter` namespace, started by `e2e.sh`'s `start_fake_overwatch` after it has
+created `/run/overwatch/hirame` — which is what
+`deploy/systemd/overwatch.service` gets from `RuntimeDirectory=`, and it matters
+in the same way, because podman creates a missing bind source as an empty
+directory.
+
+`build-images.sh` compiles the **real** daemon from the submodule as well, and
+`e2e.sh` runs it once first, recording verbatim what it says. It cannot work:
+fanotify filesystem marks require `CAP_SYS_ADMIN` in the **initial** user
+namespace, which no nesting depth can supply. The probe runs before the stand-in
+starts, because both bind the same socket and an "address already in use" would
+hide the error worth recording.
 
 The stand-in answers the same `OverwatchService` on the same unix socket, reads
 the same `deploy/config/overwatch.json`, and accepts the same two argv shapes
-the unit uses (`server serve --config …` and `client --socket … status`), so
-only `Image=` is overridden.
+(`server serve --config …` and `client --socket … status`), so nothing about the
+deployment has to be overridden for it — the indexer bind-mounts the same
+directory and dials the same path it would in production.
 
 - **`Scan` really walks the filesystem.** Every path, size, mode and mtime the
   indexer records came from the kernel.
@@ -170,9 +218,18 @@ summary table; a failing scenario does not abort the run.
   runs neither the network nor the pod, because neither can be created here.
   `hirame.network` carries the two fallbacks inline; they still need a host
   with a working network backend to check.
-- **Rootless behaviour generally.** Podman runs rootful inside the nested
-  namespace, as gahaku's harness does, so the rootless `overwatch` failure and
-  the `rootlessport` publish path are both out of reach.
+- **The privilege model, and with it the socket handoff.** Podman runs rootful
+  *inside* the nested namespace, as gahaku's harness does, so there is no
+  subuid mapping between the container and the stand-in daemon and no service
+  account: the indexer's `User=10001:0` reaches the socket here because gid 0
+  is gid 0 in this namespace, which is not the reason it works in the
+  deployment. The whole argument in `deploy/README.md`'s socket-handoff section
+  — `Group=hirame`, container gid 0 mapping to the service user's primary
+  group — is therefore **unexercised**, and so is the `--userns=keep-id` trap
+  it warns about. A host with a real service account is the only place to
+  settle it; the `stat` check in that section is the cheapest form.
+- **`loginctl enable-linger`, `%h` as a real home, and `subuid`/`subgid`
+  allocation** are all supplied by the namespace here rather than tested.
 - **`Restart=` and crash recovery** are outside what the supervisor models.
 - **Duplicate-event idempotency** is covered by `internal/ingest`'s tests, not
   here: the stand-in daemon emits no events to duplicate.

@@ -17,8 +17,8 @@
 #     prevent.
 #   * RemainAfterExit=yes keeps the successful run "active", so the Requires=
 #     of the dependents is satisfied rather than re-triggering a migration per
-#     dependent. The cost: `systemctl --user restart search-api` alone will not
-#     re-run migrations after a redeploy. Restart this unit first — see
+#     dependent. The cost: `systemctl restart search-api` alone will not re-run
+#     migrations after a redeploy. Restart this unit first — see
 #     deploy/README.md.
 #   * Requires=/After= on postgres.service, whose Notify=healthy makes "started"
 #     mean "pg_isready passes". Ordering against a container that merely exists

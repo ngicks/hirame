@@ -7,7 +7,7 @@
 scenario_s1() {
 	log "S1: discarding any previous volumes"
 	sup stop "$UNITS" $APP_UNITS $INFRA_UNITS >/dev/null 2>&1 || true
-	$PODMAN volume rm -f hirame-db hirame-objectstore hirame-overwatch-run >/dev/null 2>&1 || true
+	$PODMAN volume rm -f hirame-db hirame-objectstore >/dev/null 2>&1 || true
 	rm -f /run/pnp/quadlet-supervisor.json
 
 	log "S1: creating volumes and backing the chown-needing ones with tmpfs"
@@ -15,8 +15,9 @@ scenario_s1() {
 	# The ParadeDB image su-execs to uid 999 and versitygw to its own user,
 	# and both chown their data directory first. podman's volume directory is
 	# on a filesystem an ancestor user namespace owns, which rejects that;
-	# a tmpfs mounted here does not. The overwatch run volume holds only a
-	# socket the root-owned daemon creates, so it needs nothing.
+	# a tmpfs mounted here does not. The overwatch socket needs none of this:
+	# it lives on /run, outside podman's volumes entirely, as it does in the
+	# deployment (D-009).
 	pnp_volume_tmpfs hirame-db 3g
 	pnp_volume_tmpfs hirame-objectstore 1g
 

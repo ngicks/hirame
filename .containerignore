@@ -13,3 +13,8 @@
 **/dist
 **/.git
 **/apm_modules
+
+# The end-to-end harness's two compiled daemons (~33 MB). Not a `**/` pattern
+# because it names one directory, not a repeating one: deploy/test/build-images.sh
+# writes them there, and the first build after a run would otherwise ship them.
+deploy/test/bin

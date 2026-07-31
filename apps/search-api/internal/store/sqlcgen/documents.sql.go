@@ -466,16 +466,29 @@ const setDocumentCurrentVersion = `-- name: SetDocumentCurrentVersion :one
 UPDATE documents
 SET current_content_version_id = $1, updated_at = now()
 WHERE id = $2
+  AND current_content_version_id IS NOT DISTINCT FROM $3
 RETURNING id, mountpoint_id, path, dev, ino, current_content_version_id, deleted_at, first_seen_at, updated_at
 `
 
 type SetDocumentCurrentVersionParams struct {
-	CurrentContentVersionID *int64
-	ID                      int64
+	CurrentContentVersionID  *int64
+	ID                       int64
+	ExpectedContentVersionID *int64
 }
 
+// SetDocumentCurrentVersion is a compare-and-swap rather than a blind UPDATE.
+// The version it supersedes is read in one transaction and written in another —
+// hashing sits between them and must not hold a connection — so two jobs for the
+// same path can interleave. Writing blindly would let the loser overwrite the
+// winner's flip while enqueueing invalidation for a version that is no longer
+// the superseded one, leaving the winner's thumbnails to be dropped and the
+// loser's to survive. No row comes back when the expectation no longer holds,
+// which is the caller's signal to re-read and try again.
+//
+// IS NOT DISTINCT FROM, not =, because a document that has never been extracted
+// carries NULL here and that is a legitimate expected value.
 func (q *Queries) SetDocumentCurrentVersion(ctx context.Context, arg SetDocumentCurrentVersionParams) (Document, error) {
-	row := q.db.QueryRow(ctx, setDocumentCurrentVersion, arg.CurrentContentVersionID, arg.ID)
+	row := q.db.QueryRow(ctx, setDocumentCurrentVersion, arg.CurrentContentVersionID, arg.ID, arg.ExpectedContentVersionID)
 	var i Document
 	err := row.Scan(
 		&i.ID,

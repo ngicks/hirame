@@ -133,10 +133,22 @@ VALUES (@content_hash, @size_bytes)
 ON CONFLICT (content_hash) DO UPDATE SET size_bytes = EXCLUDED.size_bytes
 RETURNING *;
 
+-- SetDocumentCurrentVersion is a compare-and-swap rather than a blind UPDATE.
+-- The version it supersedes is read in one transaction and written in another —
+-- hashing sits between them and must not hold a connection — so two jobs for the
+-- same path can interleave. Writing blindly would let the loser overwrite the
+-- winner's flip while enqueueing invalidation for a version that is no longer
+-- the superseded one, leaving the winner's thumbnails to be dropped and the
+-- loser's to survive. No row comes back when the expectation no longer holds,
+-- which is the caller's signal to re-read and try again.
+--
+-- IS NOT DISTINCT FROM, not =, because a document that has never been extracted
+-- carries NULL here and that is a legitimate expected value.
 -- name: SetDocumentCurrentVersion :one
 UPDATE documents
 SET current_content_version_id = @current_content_version_id, updated_at = now()
 WHERE id = @id
+  AND current_content_version_id IS NOT DISTINCT FROM @expected_content_version_id
 RETURNING *;
 
 -- name: UpsertExtraction :one

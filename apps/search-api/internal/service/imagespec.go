@@ -69,9 +69,9 @@ func resolveFormat(
 	return format, nil
 }
 
-// imageBounds is a resolved size bound. Zero on an axis leaves it unbounded;
-// the renderer never scales a page up, so a bound is a ceiling rather than a
-// target.
+// imageBounds is a resolved size bound: never zero on either axis, because zero
+// is what the renderer reads as unbounded. The renderer never scales a page up,
+// so a bound is a ceiling rather than a target.
 type imageBounds struct {
 	width  uint32
 	height uint32
@@ -81,18 +81,33 @@ func (b imageBounds) message() *hiramev1.ImageSize {
 	return &hiramev1.ImageSize{Width: b.width, Height: b.height}
 }
 
-// renderBounds is the bound a full-size render is held to. It is passed through
-// as asked, capped so one request cannot ask Gahaku for an arbitrarily large
-// raster.
+// renderBounds is the bound a full-size render is held to.
+//
+// An omitted axis takes the default rather than passing zero through: zero is
+// Gahaku's "no limit", so forwarding it would let a request with no max_size ask
+// for a raster as large as the page's own resolution — the opposite of the cap
+// this function exists to apply.
 func renderBounds(size *hiramev1.ImageSize) imageBounds {
 	return imageBounds{
-		width:  min(size.GetWidth(), maxRenderPixels),
-		height: min(size.GetHeight(), maxRenderPixels),
+		width:  boundRenderAxis(size.GetWidth()),
+		height: boundRenderAxis(size.GetHeight()),
 	}
 }
 
-// maxRenderPixels caps either axis of a full-size render.
-const maxRenderPixels = 5000
+func boundRenderAxis(value uint32) uint32 {
+	if value == 0 {
+		return defaultRenderPixels
+	}
+	return min(value, maxRenderPixels)
+}
+
+// Full-size render sizing. defaultRenderPixels sits above the 1600 the GUI asks
+// for, so the default is a ceiling nothing deployed actually meets, and well
+// under maxRenderPixels, which is the most any request may ask for.
+const (
+	defaultRenderPixels = 2048
+	maxRenderPixels     = 5000
+)
 
 // Thumbnail sizing. Unset selects the default; anything else is rounded up to a
 // multiple of the quantum and capped.

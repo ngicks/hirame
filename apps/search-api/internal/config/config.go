@@ -37,6 +37,13 @@ type Server struct {
 	// ReadHeaderTimeout guards against a client that opens a connection and
 	// never completes its request headers.
 	ReadHeaderTimeout time.Duration `env:"READ_HEADER_TIMEOUT" envDefault:"10s"`
+	// ReadTimeout bounds reading a whole request, body included. Every request
+	// this API takes is a small unary message — RenderPage streams its response,
+	// not its request — so this can sit well below a render's duration.
+	ReadTimeout time.Duration `env:"READ_TIMEOUT" envDefault:"30s"`
+	// IdleTimeout bounds a kept-alive connection between requests, which is what
+	// stops an idle client from holding one indefinitely.
+	IdleTimeout time.Duration `env:"IDLE_TIMEOUT" envDefault:"120s"`
 }
 
 // Database configures the PostgreSQL connection shared by the API, the River
@@ -58,6 +65,12 @@ type Tika struct {
 	Timeout time.Duration `env:"TIKA_TIMEOUT" envDefault:"5m"`
 	// MaxBytes caps the document size sent for extraction. 0 disables the cap.
 	MaxBytes int64 `env:"TIKA_MAX_BYTES"`
+	// MaxResponseBytes caps the extraction result read back. It is a separate
+	// knob from MaxBytes and defaults to a value far below it because extracted
+	// text is a fraction of its document, while a server answering with
+	// something else entirely is exactly what an uncapped read would buffer
+	// whole. 0 disables the cap.
+	MaxResponseBytes int64 `env:"TIKA_MAX_RESPONSE_BYTES" envDefault:"67108864"`
 }
 
 // Gahaku configures the document renderer.
@@ -88,6 +101,15 @@ type Storage struct {
 	// limits above. It is far shorter than a typical MaxObjectAge because the
 	// quota can be breached at any moment by a burst of renders.
 	EvictionInterval time.Duration `env:"S3_EVICTION_INTERVAL" envDefault:"15m"`
+	// SweepInterval is how often the backstop sweep runs: stale accounting no
+	// targeted invalidation removed, and objects no accounting row reaches. It
+	// is much longer than EvictionInterval because it walks the whole bucket and
+	// only ever repairs what another path already failed to do.
+	SweepInterval time.Duration `env:"S3_SWEEP_INTERVAL" envDefault:"6h"`
+	// Timeout bounds one request to the gateway. Thumbnails are small and the
+	// gateway is a container away, so this is far tighter than the render and
+	// extraction timeouts.
+	Timeout time.Duration `env:"S3_TIMEOUT" envDefault:"30s"`
 }
 
 // Watch configures the filesystem side of the indexer.
@@ -126,6 +148,10 @@ type Concurrency struct {
 	// Render caps simultaneous Gahaku render streams, counted per process:
 	// both binaries render, and Gahaku's own queue is the shared bottleneck.
 	Render int `env:"RENDER_CONCURRENCY" envDefault:"2"`
+	// Thumbnail caps simultaneous thumbnail renders, separately from Render.
+	// Sharing one cap let a handful of full-size renders — minutes long, one
+	// per viewer — lock out the thumbnails a single search page needs twenty of.
+	Thumbnail int `env:"THUMBNAIL_CONCURRENCY" envDefault:"4"`
 }
 
 // Load reads the process environment into a Config.

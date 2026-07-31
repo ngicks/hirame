@@ -75,4 +75,5 @@ type ThumbnailCache struct {
 	SizeBytes        int64
 	CreatedAt        pgtype.Timestamptz
 	LastAccessAt     pgtype.Timestamptz
+	PendingDeleteAt  pgtype.Timestamptz
 }
