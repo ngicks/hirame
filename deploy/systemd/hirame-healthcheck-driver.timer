@@ -1,0 +1,17 @@
+# podman built without the `systemd` build tag (static dists such as
+# podman-static, common on appliance hosts) compiles healthcheck timer
+# creation to a silent no-op, so containers stay "starting" forever and every
+# Notify=healthy unit hangs in activating. This timer drives the checks
+# instead; on a full podman build it merely duplicates the transient timers
+# podman creates itself. 10s sits at the low end of the HealthInterval values
+# in the quadlet units (5–15s).
+[Unit]
+Description=Drive podman healthchecks where podman lacks systemd timer support
+
+[Timer]
+OnActiveSec=5s
+OnUnitInactiveSec=10s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

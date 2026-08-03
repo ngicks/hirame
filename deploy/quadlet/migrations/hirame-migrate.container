@@ -1,6 +1,6 @@
-# The schema-migration init container of hirame.pod (D-005). It applies every
-# pending migration and exits; nothing that reads or writes the schema starts
-# until it has exited 0.
+# The schema-migration init container of the hirame deployment (D-005). It
+# applies every pending migration and exits; nothing that reads or writes the
+# schema starts until it has exited 0.
 #
 # How that is actually enforced, since "the init container ran first" is not by
 # itself a guarantee:
@@ -36,7 +36,12 @@ After=postgres.service
 # The same image as search-api and the indexer, so the migrations applied and
 # the code that reads the resulting schema can never be different builds.
 Image=localhost/hirame-search-api:latest
-Pod=hirame.pod
+# On the network, not in the pod, like versitygw-bootstrap: the generated pod
+# carries --exit-policy stop, and on a cold start the After= ordering makes
+# this oneshot the only pod member running — its exit would stop the whole pod
+# out from under the applications about to join it. postgres is reached by
+# name over the network either way.
+Network=hirame.network
 
 # DATABASE_URL. hirame.env is loaded too so a single documented environment
 # describes all three binaries; migrate ignores everything but Database.

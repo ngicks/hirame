@@ -19,8 +19,10 @@ the containers; `sudo systemctl` drives `overwatch.service` alone.
 │   │  web-gui   :8080  (caddy, SPA + /api)   │   tika      :9998      │
 │   │  search-api 127.0.0.1:8081              │   gahaku    :9000      │
 │   │  indexer                                │   versitygw :7070      │
-│   │  hirame-migrate (oneshot, init)         │                        │
 │   └─────────────────────────────────────────┘                        │
+│         hirame-migrate (oneshot, init — on the network, not in the   │
+│         pod: the pod's exit-policy would stop it when the oneshot,   │
+│         its only running member on a cold start, exits)              │
 └──────────────────────────────────────────────────────────────────────┘
       overwatch — not a container and not rootless: a host binary under the
       system systemd, sharing /run/overwatch/hirame with the indexer by bind
@@ -167,6 +169,64 @@ development one.
 Four steps, and the order matters: the service account has to exist before
 `overwatch.service` starts, because that unit's `Group=` names it. Nothing here
 wants a privileged port.
+
+The procedure is scripted in two halves, split so the target never needs a
+toolchain or a checkout. `deploy/build.sh` runs wherever podman and go are
+installed — any user, no root, no service account — and writes a
+self-contained bundle to `deploy/dist/`: the overwatch binary, the three
+images as archives, the units and templates, and a copy of the deploy script.
+Copy that one directory to the target and run the script inside it:
+
+```sh
+deploy/build.sh
+scp -r deploy/dist target:hirame
+ssh target sudo ./hirame/deploy.sh
+```
+
+`deploy.sh` does everything host-side: it creates the account, installs the
+daemon and the units, loads the images into the service user's store, and
+starts the stack. Re-running it is the redeploy path — it always refreshes
+code (the binary, every unit, the three images) and never overwrites
+configuration or credentials it finds already installed.
+`sudo deploy/install.sh` runs both halves on one host. The steps below remain
+the reference for what they do and why.
+
+### Appliance hosts (TrueNAS SCALE and similar)
+
+Verified end-to-end on TrueNAS SCALE 25.10 in a VM. Appliance systems ship no
+podman and mount `/usr` read-only, so podman comes from a static dist (e.g.
+podman-static via podman-static-dist) wired into the service user's home, and
+three deploy.sh knobs point at the writable paths:
+
+```sh
+sudo env \
+  PODMAN=/var/lib/hirame/.local/share/podman-dist/current/usr/local/bin/podman \
+  OVERWATCH_BIN=/var/lib/overwatch/overwatch \
+  DOCS_DIR=/mnt/documents \
+  ./hirame/deploy.sh
+```
+
+A non-default `DOCS_DIR` must match the same path edited into
+`overwatch.json`, `hirame.env`, and the `Volume=` lines — "Where things go".
+Platform constraints found the hard way:
+
+* `/home` is mounted noexec — create the service user with
+  `--home-dir /var/lib/hirame` before running deploy.sh, or rootless podman
+  cannot exec its helpers from `~/.local`.
+* systemd looks for user generators only in `/run/systemd/user-generators`,
+  `/etc/systemd/user-generators`, `/usr/local/lib/...` and `/usr/lib/...` —
+  never in the user's home. With `/usr` immutable, symlink the dist's quadlet
+  binary to `/etc/systemd/user-generators/podman-user-generator`; deploy.sh
+  refuses to run until some such generator exists.
+* Static podman builds carry no `systemd` build tag, and such a podman never
+  schedules healthcheck timers — silently, so every `Notify=healthy` unit
+  hangs in activating. deploy.sh installs and enables
+  `hirame-healthcheck-driver.timer` in the service user's manager, which
+  drives `podman healthcheck run` itself; on a full podman build it is
+  redundant but harmless.
+* The dist's `QUADLET_UNIT_DIRS` must include
+  `~/.config/containers/systemd` (an `environment.d` drop-in on the service
+  user), or the generator reads only the dist's own unit directory.
 
 ### 1. The service user
 
@@ -384,12 +444,21 @@ properties do the actual enforcing:
 `RemainAfterExit=yes` keeps a successful run active so the `Requires=` of both
 applications is satisfied by one run rather than triggering one per dependent.
 The cost is that after a redeploy, restarting an application alone does not
-re-run migrations:
+re-run migrations. Stop the gate and the applications together, then start the
+applications — their `Requires=` pulls a fresh migration run in, ordered.
+One stop transaction, one start transaction; two sequential `restart` commands
+race, the second cancelling the first's still-running migration job:
 
 ```sh
-systemctl --user restart hirame-migrate.service
-systemctl --user restart search-api.service indexer.service
+systemctl --user stop hirame-migrate.service search-api.service indexer.service web-gui.service
+systemctl --user start search-api.service indexer.service web-gui.service
 ```
+
+The migration container runs on `hirame.network`, not in the pod, although its
+gate protects the pod's applications: the generated pod carries
+`--exit-policy stop`, and on a cold start the ordering above makes the oneshot
+the only running pod member — as a member, its exit would stop the pod out
+from under the applications about to join it.
 
 To see what a run would do without doing it — the check to run before a deploy —
 the binary takes `-status` (reports, always succeeds) and `-dry-run` (reports,

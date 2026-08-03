@@ -1,0 +1,13 @@
+# User unit, installed into the service user's ~/.config/systemd/user by
+# deploy.sh — unlike its siblings here, which are system units.
+#
+# deploy.sh rewrites the PODMAN assignment in ExecStart to its own $PODMAN,
+# the same treatment overwatch.service gets for OVERWATCH_BIN; the command -v
+# check is what turns a podman that still fails to resolve into a failed unit
+# instead of a oneshot that "succeeds" over zero containers forever.
+[Unit]
+Description=Run podman healthchecks for hirame containers
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'PODMAN=podman; command -v "$PODMAN" >/dev/null || { echo "$PODMAN not found" >&2; exit 1; }; for c in $("$PODMAN" ps --quiet --filter health=starting --filter health=healthy --filter health=unhealthy); do "$PODMAN" healthcheck run "$c" || :; done'

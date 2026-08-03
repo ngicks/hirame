@@ -1,0 +1,4 @@
+# build.sh's artifact directory: the overwatch binary and the saved image
+# archives. Already outside the search-api build context via .containerignore's
+# **/dist.
+/dist/

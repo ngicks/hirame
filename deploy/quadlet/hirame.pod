@@ -1,20 +1,22 @@
-# The application tier: the migration init container, the indexer, the API, and
-# the GUI proxy in one network namespace.
+# The application tier: the indexer, the API, and the GUI proxy in one network
+# namespace.
 #
-# A pod rather than four containers on the network because AGENTS.md asks for
-# migrations to run as init containers of the pod their applications live in,
-# and because it is what makes the API's same-origin arrangement real (D-010):
-# search-api binds 127.0.0.1:8081, Caddy reaches it over loopback, and the only
-# thing that leaves the namespace is the published port below.
+# A pod rather than three containers on the network because it is what makes
+# the API's same-origin arrangement real (D-010): search-api binds
+# 127.0.0.1:8081, Caddy reaches it over loopback, and the only thing that
+# leaves the namespace is the published port below.
 #
 # The infrastructure services stay outside it. They are addressed by name on
 # hirame.network, which the pod joins, and each has a lifecycle — and a
 # healthcheck — of its own; folding them in would collapse four independent
 # readiness edges into one namespace with no ordering benefit.
 #
-# Quadlet does not implement podman's --init-ctr, so the "init container" is a
-# Type=oneshot member ordered ahead of the rest; migrations/ documents the
-# mechanics.
+# The migration gate is not a member either, though AGENTS.md phrases D-005 as
+# a pod with init containers: quadlet does not implement podman's --init-ctr,
+# a Type=oneshot member is the closest shape, and the generated pod's
+# --exit-policy stop would stop the pod when that member — on a cold start the
+# only one running — exits. The gate lives on hirame.network and protects the
+# members through their Requires=/After=; migrations/ documents the mechanics.
 
 [Unit]
 Description=hirame application pod
