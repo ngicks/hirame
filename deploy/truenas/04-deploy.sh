@@ -79,8 +79,8 @@ tn_wait_ssh
 # Everything below escalates in the guest, and a password prompt on a
 # tty-less ssh channel would hang rather than say so.
 tn_ssh sudo -n true >/dev/null 2>&1 ||
-	die "truenas_admin cannot sudo without a password in the guest; grant it
-	'Allow all sudo commands (no password)' before running this"
+	die "truenas_admin cannot sudo without a password in the guest; run
+	deploy/truenas/02-kit.sh, whose preflight grants it"
 
 # No trap: lib.sh owns the EXIT trap for its askpass helper. The bundle
 # archive is removed as soon as it is across, the directory at the end.
@@ -107,13 +107,25 @@ log "pointing the bundle's documents path at $GUEST_DOCS"
 tn_ssh "grep -rl /srv/documents \
 	$STAGE/config/overwatch.json $STAGE/config/hirame.env.template \
 	$STAGE/quadlet/search-api.container $STAGE/quadlet/indexer.container \
+	$STAGE/systemd/overwatch.service \
 	| xargs -r sed -i 's|/srv/documents|$GUEST_DOCS|g'"
+# The list above is easy to leave a new file out of, and the miss shows up far
+# from here — a Volume= or a RequiresMountsFor= naming a path that does not
+# exist in this guest. So it is asserted rather than trusted. Only these three
+# directories: deploy.sh itself carries /srv/documents as its DOCS_DIR default
+# and in its comments, which is correct and must stay.
+leftover=$(tn_ssh "grep -rl /srv/documents \
+	$STAGE/config $STAGE/quadlet $STAGE/systemd; test \$? -eq 1" 2>&1) ||
+	die "the shipped bundle still names /srv/documents after the rewrite:
+	${leftover:-(grep failed; its message is above)}
+	add the file to the rewrite list in ${0##*/}"
 # A config already installed by an earlier run is deliberately kept by
 # deploy.sh; one still pointing at the shipped default is ours to heal, not
 # operator tuning to preserve.
 tn_ssh "for f in /etc/hirame/overwatch.json $GUEST_HOME/.config/hirame/hirame.env; do
-	sudo test -e \$f && sudo grep -q /srv/documents \$f &&
-		sudo sed -i 's|/srv/documents|$GUEST_DOCS|g' \$f || true
+	if sudo test -e \$f && sudo grep -q /srv/documents \$f; then
+		sudo sed -i 's|/srv/documents|$GUEST_DOCS|g' \$f
+	fi
 done"
 
 # --- 3. the /etc persistence shim --------------------------------------------
@@ -162,11 +174,12 @@ log "installing the boot-persistence shim"
 tn_scp "$WORK/truenas-prep.sh" "$HERE/config/truenas-prep.service" \
 	"$HERE/config/truenas-prep.path" "$HERE/config/truenas-prep.timer" \
 	"truenas_admin@$TRUENAS_HOST:/tmp/"
-# restart, not `enable --now`: on a re-run `--now` considers a unit that ran
-# this boot done and would leave the freshly installed script unexecuted. The
-# path unit rides along because TrueNAS rewrites /etc/subuid and /etc/subgid
-# again later in the boot (observed on 25.10), after the boot-ordered service
-# already ran — the watch re-applies the entries whenever that happens.
+# restart, not `enable --now`: restart runs the script just installed
+# unconditionally, whatever the unit was doing beforehand — a run still in
+# flight from the path unit included. The path unit rides along because
+# TrueNAS rewrites /etc/subuid and /etc/subgid again later in the boot
+# (observed on 25.10), after the boot-ordered service already ran — the watch
+# re-applies the entries whenever that happens.
 tn_ssh sudo sh <<'EOF'
 set -e
 install -d -m 0755 /var/lib/hirame-deploy

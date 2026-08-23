@@ -3,10 +3,11 @@
 # the two accounts hirame runs as, and the directory the watcher indexes.
 #
 # Nothing here reaches for zpool, groupadd or useradd. Every object is created
-# through the middleware (`midclt call`) so that it is recorded in the TrueNAS
-# configuration database: the appliance re-imports pools and regenerates the
-# account files in /etc from that database on every boot, and anything written
-# behind its back is gone by the next one.
+# through the middleware -- `midclt call` over ssh for the kitting, and the REST
+# API on the forwarded UI port for the ssh bootstrap that has to come first --
+# so that it is recorded in the TrueNAS configuration database: the appliance
+# re-imports pools and regenerates the account files in /etc from that database
+# on every boot, and anything written behind its back is gone by the next one.
 #
 # The guest is TrueNAS SCALE 25.10 and every method name and payload below is
 # pinned to that release's middleware API. A different golden image means
@@ -250,18 +251,43 @@ ensure_documents() {
 # switched off for truenas_admin; the middleware REST API on the forwarded UI
 # port is the only door initially open. Turn ssh on through it (idempotent)
 # before anything below tries the ssh path.
+API_URL=https://$TRUENAS_HOST:$TRUENAS_PORT_HTTPS/api/v2.0
+
 api() { # api <method> <path> [json_body]
 	local method=$1 path=$2 body=${3-}
-	curl -ksf -m 30 -u "truenas_admin:$TRUENAS_ADMIN_PASSWORD" \
-		-X "$method" -H 'Content-Type: application/json' \
-		${body:+-d "$body"} \
-		"https://$TRUENAS_HOST:$TRUENAS_PORT_HTTPS/api/v2.0/$path"
+	# The credential is fed to curl as a config on stdin rather than through
+	# -u: a command line is world-readable on the deployment host for as long
+	# as the call runs. In a config file a quoted value takes backslash
+	# escapes, so both characters that could end the value early are escaped;
+	# backslashes first, or the quote escapes would be escaped in turn.
+	local pw=${TRUENAS_ADMIN_PASSWORD//\\/\\\\}
+	pw=${pw//\"/\\\"}
+	printf 'user = "truenas_admin:%s"\n' "$pw" |
+		curl -ksf -m 30 -K - \
+			-X "$method" -H 'Content-Type: application/json' \
+			${body:+-d "$body"} \
+			"$API_URL/$path"
 }
 
 ensure_ssh_reachable() {
 	log "waiting for the middleware UI on $TRUENAS_HOST:$TRUENAS_PORT_HTTPS ..."
 	local deadline=$((SECONDS + 600))
+	local code
 	until api GET system/info >/dev/null 2>&1; do
+		# A rejected credential looks exactly like a VM that has not booted
+		# yet, and waiting the full 600s to then blame the VM sends the
+		# operator to the wrong place. The same endpoint without credentials
+		# tells the two apart: an explicit refusal means the appliance is up
+		# and answering, and only the password can be at fault. Anything else
+		# -- no answer at all, or the 5xx nginx serves while middlewared is
+		# still starting -- is the boot still in progress, so keep waiting.
+		code=$(curl -ks -o /dev/null -w '%{http_code}' -m 10 \
+			"$API_URL/system/info" || true)
+		case "$code" in
+		401 | 403)
+			die "the middleware answers on $API_URL (HTTP $code) but refuses truenas_admin; check TRUENAS_ADMIN_PASSWORD"
+			;;
+		esac
 		[ "$SECONDS" -lt "$deadline" ] ||
 			die "middleware UI not answering on https://$TRUENAS_HOST:$TRUENAS_PORT_HTTPS after 600s; is the VM up (01-vm.sh status)?"
 		sleep 5
@@ -270,7 +296,12 @@ ensure_ssh_reachable() {
 	local user_json user_id svc_json
 	user_json=$(api GET "user?username=truenas_admin") ||
 		die "middleware REST refused truenas_admin with TRUENAS_ADMIN_PASSWORD"
-	user_id=$(jq -r '.[0].id' <<<"$user_json")
+	# An unknown username comes back as an empty array, whose .[0].id is the
+	# string "null" -- which would go on to be spelled into a request path and
+	# fail much later with something that reads like a middleware bug.
+	user_id=$(jq -r '.[0].id // empty' <<<"$user_json")
+	[ -n "$user_id" ] ||
+		die "no user truenas_admin in the middleware reply"
 	if [ "$(jq -r '.[0].ssh_password_enabled' <<<"$user_json")" != true ]; then
 		log "enabling password ssh login for truenas_admin"
 		api PUT "user/id/$user_id" '{"ssh_password_enabled": true}' >/dev/null ||
@@ -307,13 +338,13 @@ preflight() {
 	tn_wait_ssh
 
 	# One call that exercises the whole chain at once -- ssh, the password, and
-	# sudo without a prompt -- so a golden image missing any of them is named
-	# here instead of failing halfway through the kitting below. -n makes sudo
-	# fail rather than sit waiting for a password on a session with no tty.
+	# sudo without a prompt -- so a break in any of them is named here instead
+	# of failing halfway through the kitting below. -n makes sudo fail rather
+	# than sit waiting for a password on a session with no tty.
 	local err
 	if ! err=$(tn_ssh sudo -n midclt call system.info 2>&1 >/dev/null); then
 		printf '%s\n' "$err" >&2
-		die "cannot reach the middleware as truenas_admin; the golden image is expected to have ssh enabled, password authentication for truenas_admin (TRUENAS_ADMIN_PASSWORD) and passwordless sudo for that account"
+		die "cannot reach the middleware as truenas_admin over ssh; the bootstrap just above switched the ssh service on and granted truenas_admin password login and passwordless sudo, so a failure here is the middleware not having applied one of those, or TRUENAS_ADMIN_PASSWORD being wrong"
 	fi
 }
 

@@ -142,7 +142,7 @@ cmd_up() {
 	$SUDO virsh define "$TRUENAS_INSTANCE_DIR/domain.xml" >/dev/null
 	$SUDO virsh start "$TRUENAS_VM_NAME" >/dev/null
 
-	log "started; the appliance takes a few minutes to answer on ssh"
+	log "started; the appliance boots in a few minutes, and 02-kit.sh switches ssh on and kits it"
 	tn_port_table
 }
 

@@ -9,6 +9,10 @@
 [Unit]
 Description=Restore the podman user prerequisites TrueNAS wipes from /etc at boot
 Before=user@.service systemd-user-sessions.service
+# TrueNAS rewrites those files in a burst, and the path and timer units retrigger
+# with it: the default limit of 5 starts in 10s would be hit and would leave the
+# unit refusing to start, with the path unit's watch dead along with it.
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot

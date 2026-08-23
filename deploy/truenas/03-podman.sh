@@ -10,8 +10,8 @@
 # writable and executable at once.
 #
 # The guest is TrueNAS SCALE 25.10; the guest-side assumptions here (sudo for
-# truenas_admin, runuser, loginctl, a systemd user manager) are pinned to it and
-# want re-checking against a different golden image.
+# truenas_admin, systemd-run, loginctl, a systemd user manager) are pinned to it
+# and want re-checking against a different golden image.
 #
 # Re-running is safe and is the upgrade path: the artifact re-extracts over its
 # own tag, the environment file is rewritten with the same content, and linger
@@ -168,14 +168,24 @@ install_dist() {
 	# --skip-systemd leaves exactly that step out; the home-side links (config,
 	# environment.d, user units, the `current` symlink) are still made.
 	# No --tag on extract: the artifact stamps its own, so the tree always
-	# names the version actually installed; link is then pointed at that stamp.
-	# Re-running extracts over the existing tree and relinks, which is why a
-	# re-run is safe.
+	# names the version actually installed. That stamp is the artifact's
+	# version, so the same string is read off the file name here and link is
+	# pointed at it -- naming the tag beats picking the newest directory, which
+	# aims `current` at whichever tree was touched last once two of them
+	# coexist. Re-running extracts over the existing tree and relinks, which is
+	# why a re-run is safe.
+	local tag=${TAR##*/}
+	tag=${tag#podman-static-}
+	tag=${tag%.tar.zst}
 	log "installing the distribution under $GUEST_HOME/$DIST_SUBDIR"
 	as_podman "$tool_dst" --log=text extract --tar "$staged_tar"
-	local tag
-	tag=$(as_podman sh -c "ls -1t '$GUEST_HOME/$DIST_SUBDIR' | grep -v '^current\$' | head -1")
-	[ -n "$tag" ] || die "no dist tree appeared under $GUEST_HOME/$DIST_SUBDIR after extract"
+	if ! as_podman test -d "$GUEST_HOME/$DIST_SUBDIR/$tag" >/dev/null 2>&1; then
+		local listing
+		listing=$(as_podman ls -1 "$GUEST_HOME/$DIST_SUBDIR" 2>&1 | tr '\n' ' ') || true
+		die "extract left no tree at $GUEST_HOME/$DIST_SUBDIR/$tag; the tag is
+    read off the artifact name (${TAR##*/}) and has to match the one the
+    artifact stamps on itself. That directory holds: ${listing:-nothing}"
+	fi
 	as_podman "$tool_dst" --log=text link --skip-systemd --tag "$tag"
 
 	# Routes quadlet's unit search at the two directories the deployment
