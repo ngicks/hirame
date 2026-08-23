@@ -196,7 +196,7 @@ the reference for what they do and why.
 Verified end-to-end on TrueNAS SCALE 25.10 in a VM. Appliance systems ship no
 podman and mount `/usr` read-only, so podman comes from a static dist (e.g.
 podman-static via podman-static-dist) wired into the service user's home, and
-three deploy.sh knobs point at the writable paths:
+deploy.sh's path knobs point at the writable paths:
 
 ```sh
 sudo env \
@@ -208,6 +208,18 @@ sudo env \
 
 A non-default `DOCS_DIR` must match the same path edited into
 `overwatch.json`, `hirame.env`, and the `Volume=` lines — "Where things go".
+
+Two more knobs cover an account layout that is not this document's default.
+`SERVICE_USER` (default `hirame`) names the account the rootless stack runs
+as, for a host that already has a service account of its own. The group is
+**not** a second knob: deploy.sh derives the account's primary group and
+rewrites `Group=` in the `overwatch.service` it installs, and the group column
+of the `tmpfiles.d` entry with it, because those two are the socket handoff —
+"The socket handoff", below. `QUADLET_DIR` (default
+`~SERVICE_USER/.config/containers/systemd`) moves the unit install directory;
+a non-default one has to be a directory the generator searches, which is the
+`QUADLET_UNIT_DIRS` point below.
+
 Platform constraints found the hard way:
 
 * `/home` is mounted noexec — create the service user with
@@ -670,7 +682,11 @@ go", which works through the same gid 0 and costs nothing.
 
 `Group=` must therefore name the service user's **primary** group. If the
 account layout differs — a shared `services` group, say — that one line in
-`overwatch.service` is what changes, and nothing else.
+`overwatch.service` is what changes, together with the group column of
+`hirame-overwatch.tmpfiles.conf` that has to stay equal to it, and nothing
+else. deploy.sh does both edits itself: it derives the group from
+`SERVICE_USER` and rewrites the copies it installs, leaving the files in the
+checkout with the default baked in.
 
 `go-overwatch/overwatch/doc/ops/containers.md` describes the group-membership
 route for consumers that are not podman containers.

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Deploy prebuilt artifacts on this host, encoding the procedure of
-# deploy/README.md: create the hirame service user, install the overwatch
+# deploy/README.md: create the service user, install the overwatch
 # daemon as a system service, install the quadlet units and configuration,
 # load the images into the service user's store, and start the stack.
 #
@@ -19,11 +19,16 @@
 # re-run with the pod already up, migrations are re-run and the applications
 # restarted, per the README's redeploy note.
 #
-# The service user name is fixed: the units bake `hirame` into Group=,
-# %h-relative paths, and the socket handoff, so it is not a knob here either.
+# Every knob below is an env override whose default is what deploy/README.md
+# documents; a host whose account layout or writable paths differ sets them on
+# the command line — README, "Appliance hosts".
 set -euo pipefail
 
-SERVICE_USER=hirame
+# The account the rootless stack runs as. Its *primary* group is the whole
+# socket handoff, so it is derived from the account below rather than asked
+# for, and rewritten into the copies of overwatch.service and the tmpfiles
+# entry this script installs — the units ship the default baked in.
+SERVICE_USER=${SERVICE_USER:-hirame}
 SOCKET=/run/overwatch/hirame/hirame.sock
 IMAGES="hirame-search-api hirame-web-gui gahaku"
 
@@ -37,6 +42,11 @@ OVERWATCH_BIN=${OVERWATCH_BIN:-/usr/local/bin/overwatch}
 # must match the same path already edited into overwatch.json, hirame.env,
 # and the Volume= lines — README, "Where things go".
 DOCS_DIR=${DOCS_DIR:-/srv/documents}
+# Where the quadlet units are installed; defaults to the service user's
+# ~/.config/containers/systemd once its home is known, below. A non-default
+# directory only takes effect if the generator searches it — README,
+# "Appliance hosts".
+QUADLET_DIR=${QUADLET_DIR:-}
 
 # In a bundle the artifacts sit next to this script; in the checkout they are
 # under dist/, where build.sh puts them.
@@ -54,11 +64,11 @@ die() { printf '\e[1;31m[deploy] ERROR:\e[0m %s\n' "$*" >&2; exit 1; }
 # From the service user's home, not the caller's cwd: the bundle often sits
 # under /root, and rootless podman re-execs chdir into the inherited cwd as
 # the service user.
-as_hirame() {
-	(cd "$HIRAME_HOME" &&
+as_service() {
+	(cd "$SERVICE_HOME" &&
 		runuser -u "$SERVICE_USER" -- env \
-			HOME="$HIRAME_HOME" \
-			XDG_RUNTIME_DIR="/run/user/$HIRAME_UID" \
+			HOME="$SERVICE_HOME" \
+			XDG_RUNTIME_DIR="/run/user/$SERVICE_UID" \
 			"$@")
 }
 
@@ -106,9 +116,14 @@ if ! id "$SERVICE_USER" >/dev/null 2>&1; then
 else
 	log "user $SERVICE_USER exists"
 fi
-HIRAME_UID=$(id -u "$SERVICE_USER")
-HIRAME_HOME=$(getent passwd "$SERVICE_USER" | cut -d: -f6)
-[ -d "$HIRAME_HOME" ] || die "$SERVICE_USER has no home directory ($HIRAME_HOME); the units resolve %h"
+SERVICE_UID=$(id -u "$SERVICE_USER")
+SERVICE_HOME=$(getent passwd "$SERVICE_USER" | cut -d: -f6)
+[ -d "$SERVICE_HOME" ] || die "$SERVICE_USER has no home directory ($SERVICE_HOME); the units resolve %h"
+# The primary group and no other: a container's gid 0 resolves to exactly that
+# one under the default rootless mapping, which is what reaches the socket —
+# see the socket-handoff section of deploy/README.md.
+SERVICE_GROUP=$(id -gn "$SERVICE_USER")
+QUADLET_DIR=${QUADLET_DIR:-$SERVICE_HOME/.config/containers/systemd}
 
 # One free range for both files, computed from both files: usermod hands out
 # overlapping ranges without complaint, and two accounts sharing one are not
@@ -128,10 +143,10 @@ ensure_subids /etc/subgid --add-subgids
 loginctl enable-linger "$SERVICE_USER"
 log "waiting for the $SERVICE_USER user manager"
 for _ in $(seq 30); do
-	[ -d "/run/user/$HIRAME_UID/systemd" ] && break
+	[ -d "/run/user/$SERVICE_UID/systemd" ] && break
 	sleep 1
 done
-[ -d "/run/user/$HIRAME_UID/systemd" ] || die "user manager for $SERVICE_USER did not start under lingering"
+[ -d "/run/user/$SERVICE_UID/systemd" ] || die "user manager for $SERVICE_USER did not start under lingering"
 
 # --- 2. the documents directory ----------------------------------------------
 
@@ -145,10 +160,10 @@ done
 # every redeploy — so the grant under it stays the operator's job.
 if [ ! -d "$DOCS_DIR" ]; then
 	log "creating $DOCS_DIR"
-	install -d -m 0750 -g "$SERVICE_USER" "$DOCS_DIR"
+	install -d -m 0750 -g "$SERVICE_GROUP" "$DOCS_DIR"
 elif ! runuser -u "$SERVICE_USER" -- test -r "$DOCS_DIR"; then
 	warn "$DOCS_DIR is not readable by $SERVICE_USER; grant group read access" \
-		"(chgrp -R $SERVICE_USER, chmod -R g+rX) or an equivalent ACL"
+		"(chgrp -R $SERVICE_GROUP, chmod -R g+rX) or an equivalent ACL"
 fi
 
 # --- 3. the overwatch daemon (host binary, system service) -------------------
@@ -160,11 +175,17 @@ if [ -e /etc/hirame/overwatch.json ]; then
 else
 	install -Dm0644 "$HERE/config/overwatch.json" /etc/hirame/overwatch.json
 fi
-sed "s|/usr/local/bin/overwatch|$OVERWATCH_BIN|g" "$HERE/systemd/overwatch.service" \
-	>/etc/systemd/system/overwatch.service
+sed -e "s|/usr/local/bin/overwatch|$OVERWATCH_BIN|g" \
+	-e "s|^Group=hirame$|Group=$SERVICE_GROUP|" \
+	"$HERE/systemd/overwatch.service" >/etc/systemd/system/overwatch.service
 chmod 0644 /etc/systemd/system/overwatch.service
-install -Dm0644 "$HERE/systemd/hirame-overwatch.tmpfiles.conf" \
-	/etc/tmpfiles.d/hirame-overwatch.conf
+# The group on the socket directory has to stay equal to the unit's Group= —
+# the conf says why — so one derived value rewrites both. The path component
+# is the deployment's name, not the account's, and stays as shipped.
+sed "s|^\(d /run/overwatch/hirame .*root \)hirame|\1$SERVICE_GROUP|" \
+	"$HERE/systemd/hirame-overwatch.tmpfiles.conf" \
+	>/etc/tmpfiles.d/hirame-overwatch.conf
+chmod 0644 /etc/tmpfiles.d/hirame-overwatch.conf
 systemd-tmpfiles --create /etc/tmpfiles.d/hirame-overwatch.conf
 systemctl daemon-reload
 systemctl enable overwatch.service
@@ -176,7 +197,7 @@ systemctl restart overwatch.service
 log "verifying the socket handoff as $SERVICE_USER"
 ok=
 for _ in $(seq 10); do
-	if as_hirame "$OVERWATCH_BIN" client --socket "$SOCKET" status >/dev/null 2>&1; then
+	if as_service "$OVERWATCH_BIN" client --socket "$SOCKET" status >/dev/null 2>&1; then
 		ok=1
 		break
 	fi
@@ -195,8 +216,8 @@ done
 # by the service user.
 for name in $IMAGES; do
 	log "loading localhost/$name:latest"
-	as_hirame "$PODMAN" load --quiet <"$ART/images/$name.tar"
-	as_hirame "$PODMAN" image exists "localhost/$name:latest" ||
+	as_service "$PODMAN" load --quiet <"$ART/images/$name.tar"
+	as_service "$PODMAN" image exists "localhost/$name:latest" ||
 		die "$ART/images/$name.tar did not carry the tag localhost/$name:latest"
 done
 
@@ -214,39 +235,39 @@ fi
 # Directories as the service user so nothing under its home is root-owned,
 # files by root so the checkout need not be readable by that user.
 log "installing quadlet units and configuration"
-as_hirame mkdir -p "$HIRAME_HOME/.config/containers/systemd" \
-	"$HIRAME_HOME/.config/systemd/user" "$HIRAME_HOME/.config/hirame"
-as_hirame chmod 0700 "$HIRAME_HOME/.config/hirame"
-cp -r "$HERE/quadlet/." "$HIRAME_HOME/.config/containers/systemd/"
-chown -R "$SERVICE_USER:$SERVICE_USER" "$HIRAME_HOME/.config/containers/systemd"
+as_service mkdir -p "$QUADLET_DIR" \
+	"$SERVICE_HOME/.config/systemd/user" "$SERVICE_HOME/.config/hirame"
+as_service chmod 0700 "$SERVICE_HOME/.config/hirame"
+cp -r "$HERE/quadlet/." "$QUADLET_DIR/"
+chown -R "$SERVICE_USER:$SERVICE_GROUP" "$QUADLET_DIR"
 
 # See the comment in the timer unit: required where podman lacks the systemd
 # build tag, redundant but harmless on a full build. The sed mirrors the
 # OVERWATCH_BIN treatment of overwatch.service: the unit runs under the user
 # manager, whose PATH need not resolve a non-default $PODMAN.
 sed "s|PODMAN=podman|PODMAN=$PODMAN|" "$HERE/systemd/hirame-healthcheck-driver.service" \
-	>"$HIRAME_HOME/.config/systemd/user/hirame-healthcheck-driver.service"
-install -m 0644 -o "$SERVICE_USER" -g "$SERVICE_USER" \
+	>"$SERVICE_HOME/.config/systemd/user/hirame-healthcheck-driver.service"
+install -m 0644 -o "$SERVICE_USER" -g "$SERVICE_GROUP" \
 	"$HERE/systemd/hirame-healthcheck-driver.timer" \
-	"$HIRAME_HOME/.config/systemd/user/"
-chown "$SERVICE_USER:$SERVICE_USER" "$HIRAME_HOME/.config/systemd/user/hirame-healthcheck-driver.service"
-chmod 0644 "$HIRAME_HOME/.config/systemd/user/hirame-healthcheck-driver.service"
+	"$SERVICE_HOME/.config/systemd/user/"
+chown "$SERVICE_USER:$SERVICE_GROUP" "$SERVICE_HOME/.config/systemd/user/hirame-healthcheck-driver.service"
+chmod 0644 "$SERVICE_HOME/.config/systemd/user/hirame-healthcheck-driver.service"
 
 # hirame.env and postgresql.conf carry deployment tuning; keep operator
 # edits. 0644 on purpose, postgresql.conf especially: it is bind-mounted and
 # read by the container's mapped uid — see the README.
 install_config() { # <source name> <target name>
-	if [ -e "$HIRAME_HOME/.config/hirame/$2" ]; then
+	if [ -e "$SERVICE_HOME/.config/hirame/$2" ]; then
 		log "keeping existing ~$SERVICE_USER/.config/hirame/$2"
 	else
-		install -m 0644 -o "$SERVICE_USER" -g "$SERVICE_USER" \
-			"$HERE/config/$1" "$HIRAME_HOME/.config/hirame/$2"
+		install -m 0644 -o "$SERVICE_USER" -g "$SERVICE_GROUP" \
+			"$HERE/config/$1" "$SERVICE_HOME/.config/hirame/$2"
 	fi
 }
 install_config hirame.env.template hirame.env
 install_config postgresql.conf postgresql.conf
 
-if [ -e "$HIRAME_HOME/.config/hirame/secrets.env" ]; then
+if [ -e "$SERVICE_HOME/.config/hirame/secrets.env" ]; then
 	log "keeping existing credentials"
 else
 	log "generating credentials"
@@ -256,45 +277,45 @@ else
 		-e "s/__S3_ACCESS_KEY__/$(openssl rand -hex 16)/g" \
 		-e "s/__S3_SECRET_KEY__/$(openssl rand -hex 32)/g" \
 		"$HERE/config/secrets.env.template" >"$tmp/secrets.env"
-	install -m 0600 -o "$SERVICE_USER" -g "$SERVICE_USER" \
-		"$tmp/secrets.env" "$HIRAME_HOME/.config/hirame/secrets.env"
+	install -m 0600 -o "$SERVICE_USER" -g "$SERVICE_GROUP" \
+		"$tmp/secrets.env" "$SERVICE_HOME/.config/hirame/secrets.env"
 fi
 
 # --- 5. generate and start ---------------------------------------------------
 
 log "starting the stack"
-as_hirame systemctl --user daemon-reload
-as_hirame systemctl --user enable --now hirame-healthcheck-driver.timer
-if as_hirame systemctl --user is-active --quiet hirame-pod.service; then
+as_service systemctl --user daemon-reload
+as_service systemctl --user enable --now hirame-healthcheck-driver.timer
+if as_service systemctl --user is-active --quiet hirame-pod.service; then
 	# One stop transaction, one start transaction. Sequential restarts race:
 	# the second command's transaction cancels the first's still-running start
 	# job mid-migration ("Job for hirame-migrate.service canceled"). The stop
 	# resets the migrate oneshot, and Requires= pulls it back in, ordered,
 	# with the applications.
-	as_hirame systemctl --user stop \
+	as_service systemctl --user stop \
 		hirame-migrate.service search-api.service indexer.service web-gui.service
-	as_hirame systemctl --user start search-api.service indexer.service web-gui.service
+	as_service systemctl --user start search-api.service indexer.service web-gui.service
 else
-	as_hirame systemctl --user start hirame-pod.service
+	as_service systemctl --user start hirame-pod.service
 fi
 
 # Generous: the first start pulls the external images (ParadeDB, Tika,
 # VersityGW) before anything can become healthy.
 ok=
 for _ in $(seq 300); do
-	if as_hirame systemctl --user is-active --quiet web-gui.service; then
+	if as_service systemctl --user is-active --quiet web-gui.service; then
 		ok=1
 		break
 	fi
 	sleep 2
 done
-as_hirame systemctl --user --no-pager list-units 'hirame*' 'postgres*' 'tika*' \
+as_service systemctl --user --no-pager list-units 'hirame*' 'postgres*' 'tika*' \
 	'versitygw*' 'gahaku*' 'search-api*' 'indexer*' 'web-gui*' || true
 [ -n "$ok" ] || die "web-gui.service did not come up; inspect with:
-	sudo runuser -u $SERVICE_USER -- env XDG_RUNTIME_DIR=/run/user/$HIRAME_UID \\
+	sudo runuser -u $SERVICE_USER -- env XDG_RUNTIME_DIR=/run/user/$SERVICE_UID \\
 		journalctl --user -u hirame-migrate -u search-api -u web-gui"
 
 log "done — the GUI is on http://<host>:8080"
-log "put documents under $DOCS_DIR ($SERVICE_USER-group-readable), or point the"
+log "put documents under $DOCS_DIR ($SERVICE_GROUP-group-readable), or point the"
 log "deployment at a real archive per deploy/README.md, 'Where things go'"
 log "back up the database: see deploy/README.md, 'Volumes, ownership, and backup'"
