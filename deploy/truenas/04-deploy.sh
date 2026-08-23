@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+# Deploy hirame into the kitted VM: build the deploy/build.sh bundle here, ship
+# it to the guest, install the shim that keeps rootless podman's /etc state
+# across guest reboots, and run the bundle's own deploy.sh in there.
+#
+# The guest is TrueNAS SCALE 25.10. Everything below is pinned to what the
+# sibling scripts left in that guest — the podman account and its home on the
+# pool, the static podman dist under it, the documents directory — and to that
+# release's habit of rebuilding /etc from its configuration database at every
+# boot, which is the whole reason for the shim.
+#
+#	04-deploy.sh                 build the bundle, then deploy
+#	SKIP_BUILD=1 04-deploy.sh    deploy deploy/dist as it stands
+#
+# The bundle is rebuilt on every run unless SKIP_BUILD=1: build.sh alone knows
+# what its output depends on, and silently deploying a stale dist costs far
+# more than the rebuild does.
+#
+# Re-running is the redeploy path: the bundle is reshipped, the shim
+# re-installed with the range the guest already has, and deploy.sh re-run —
+# it is idempotent, and so is the shim.
+set -euo pipefail
+
+HERE=$(cd "$(dirname "$0")" && pwd)
+. "$HERE/lib.sh"
+REPO=$(cd "$HERE/../.." && pwd)
+DIST=$REPO/deploy/dist
+IMAGES="hirame-search-api hirame-web-gui gahaku"
+
+# The guest layout the earlier scripts created. The home is on the pool
+# because /home is mounted noexec there and rootless podman execs its helpers
+# out of ~/.local.
+GUEST_HOME=/mnt/tank/home/podman
+GUEST_DIST=$GUEST_HOME/.local/share/podman-dist/current
+GUEST_PODMAN=$GUEST_DIST/usr/local/bin/podman
+GUEST_QUADLET=$GUEST_DIST/usr/local/lib/podman/quadlet
+# The second entry of the dist's QUADLET_UNIT_DIRS, so the user generator
+# finds the units deploy.sh installs; the first entry belongs to the dist.
+GUEST_QUADLET_DIR=$GUEST_HOME/.config/containers-quadlet-additional
+GUEST_DOCS=/mnt/tank/share/documents
+GUEST_OVERWATCH=/var/lib/overwatch/overwatch
+# The bundle is unpacked on the pool: it carries some 700 MiB of image
+# archives, and the pool is both the roomy filesystem in that guest and an
+# exec one, which running deploy.sh out of the unpacked bundle needs.
+STAGE=/mnt/tank/hirame-deploy
+
+# --- 1. the bundle -----------------------------------------------------------
+
+command -v curl >/dev/null ||
+	die "required command not found: curl (the final check reaches the GUI with it)"
+
+if [ "${SKIP_BUILD:-}" = 1 ]; then
+	log "SKIP_BUILD=1: shipping $DIST as it stands"
+	# The same artifacts deploy.sh refuses to start without, checked here so a
+	# half-built dist fails before 700 MiB goes over the wire.
+	[ -x "$DIST/deploy.sh" ] && [ -x "$DIST/overwatch" ] && [ -f "$DIST/quadlet/hirame.pod" ] ||
+		die "$DIST is not a complete bundle; unset SKIP_BUILD to build it"
+	for name in $IMAGES; do
+		[ -f "$DIST/images/$name.tar" ] ||
+			die "no $DIST/images/$name.tar; unset SKIP_BUILD to build it"
+	done
+else
+	# Both are build-host requirements only — the guest needs neither — so they
+	# are checked before build.sh gets far enough to leave a partial dist
+	# behind. $PODMAN is the knob build.sh itself reads.
+	for cmd in "${PODMAN:-podman}" go; do
+		command -v "$cmd" >/dev/null ||
+			die "required command not found: $cmd; the bundle is built on this host (install it, or
+	run with SKIP_BUILD=1 to ship the $DIST of an earlier build)"
+	done
+	log "building the deployment bundle"
+	"$REPO/deploy/build.sh"
+fi
+
+# --- 2. ship it --------------------------------------------------------------
+
+tn_wait_ssh
+
+# Everything below escalates in the guest, and a password prompt on a
+# tty-less ssh channel would hang rather than say so.
+tn_ssh sudo -n true >/dev/null 2>&1 ||
+	die "truenas_admin cannot sudo without a password in the guest; grant it
+	'Allow all sudo commands (no password)' before running this"
+
+# No trap: lib.sh owns the EXIT trap for its askpass helper. The bundle
+# archive is removed as soon as it is across, the directory at the end.
+WORK=$(mktemp -d) || die "could not create a temporary directory"
+
+log "packing $DIST"
+tar -C "$DIST" -cf "$WORK/bundle.tar" .
+
+# Uncompressed: the transfer is a loopback port forward, where compressing
+# 700 MiB costs more than it saves.
+log "shipping the bundle to $STAGE ($(du -h "$WORK/bundle.tar" | cut -f1))"
+tn_ssh "sudo rm -rf $STAGE && sudo install -d -m 0755 -o truenas_admin $STAGE"
+tn_scp "$WORK/bundle.tar" "truenas_admin@$TRUENAS_HOST:$STAGE/bundle.tar"
+rm -f "$WORK/bundle.tar"
+tn_ssh "tar -xf $STAGE/bundle.tar -C $STAGE && rm -f $STAGE/bundle.tar"
+
+# --- 3. the /etc persistence shim --------------------------------------------
+
+# The range is settled once, here, and baked into the shim: the shim then
+# writes the same lines every boot. Reusing whatever the guest already has
+# matters on a re-run — a second, different range for one account is what
+# shadow-utils reads as an overlap, and images already loaded were mapped
+# through the first one.
+#
+# One range for both files. The container uid and gid maps are the same
+# width, and keeping them equal is what makes the reuse check above a single
+# question instead of two that can disagree.
+log "settling the podman subuid/subgid range"
+SUBID_LINE=$(tn_ssh sh <<'EOF'
+line=$(grep '^podman:' /etc/subuid 2>/dev/null | head -n1 || true)
+if [ -n "$line" ]; then
+	printf '%s\n' "$line"
+	exit 0
+fi
+# The first 65536-aligned range past every entry in both files, and never
+# below 100000 — below that is where distributions put system accounts.
+start=$({ cat /etc/subuid /etc/subgid 2>/dev/null || true; } |
+	awk -F: 'NF>=3 {e=$2+$3; if (e>m) m=e}
+		END{if (m<100000) print 100000; else print int((m+65535)/65536)*65536}')
+printf 'podman:%s:65536\n' "$start"
+EOF
+)
+# It is about to be sed-substituted into a script that runs as root at every
+# boot, so nothing but a subid entry is allowed through.
+[[ $SUBID_LINE =~ ^podman:[0-9]+:[0-9]+$ ]] ||
+	die "could not read a subuid range from the guest, got: '$SUBID_LINE'"
+log "podman subid range: $SUBID_LINE"
+
+# On a copy — the template in config/ stays a template.
+sed -e "s|@SUBUID_LINE@|$SUBID_LINE|" \
+	-e "s|@SUBGID_LINE@|$SUBID_LINE|" \
+	-e "s|@QUADLET_BIN@|$GUEST_QUADLET|" \
+	"$HERE/config/truenas-prep.sh" >"$WORK/truenas-prep.sh"
+# Catches a template that grew a token this script does not know about,
+# before the half-filled script is installed as a boot-time root job.
+! grep -q '@[A-Za-z_]*@' "$WORK/truenas-prep.sh" ||
+	die "unsubstituted tokens left in truenas-prep.sh: $(grep -o '@[A-Za-z_]*@' "$WORK/truenas-prep.sh" | sort -u | tr '\n' ' ')"
+
+log "installing the boot-persistence shim"
+tn_scp "$WORK/truenas-prep.sh" "$HERE/config/truenas-prep.service" \
+	"truenas_admin@$TRUENAS_HOST:/tmp/"
+# restart, not `enable --now`: the unit is a RemainAfterExit oneshot, so on a
+# re-run `--now` would consider an already-active unit done and leave the
+# freshly installed script unexecuted.
+tn_ssh sudo sh <<'EOF'
+set -e
+install -d -m 0755 /var/lib/hirame-deploy
+install -m 0755 /tmp/truenas-prep.sh /var/lib/hirame-deploy/truenas-prep.sh
+install -m 0644 /tmp/truenas-prep.service /etc/systemd/system/truenas-prep.service
+rm -f /tmp/truenas-prep.sh /tmp/truenas-prep.service
+systemctl daemon-reload
+systemctl enable truenas-prep.service
+systemctl restart truenas-prep.service
+EOF
+
+state=$(tn_ssh 'systemctl is-active truenas-prep.service' 2>/dev/null || true)
+[ "$state" = active ] || {
+	tn_ssh 'systemctl --no-pager status truenas-prep.service' || true
+	die "truenas-prep.service is '$state', not active"
+}
+# What the shim was installed for, read back rather than assumed: without
+# these two deploy.sh's own preflight stops the deployment, and rootless
+# podman could not map a container uid anyway.
+for f in /etc/subuid /etc/subgid; do
+	# Captured, then matched locally: `tn_ssh ... | grep -q` closes the pipe
+	# on the first hit and fails the pipeline under pipefail.
+	content=$(tn_ssh "cat $f" || true)
+	grep -qxF "$SUBID_LINE" <<<"$content" ||
+		die "$f does not carry '$SUBID_LINE' after truenas-prep.service ran"
+done
+tn_ssh 'test -x /etc/systemd/user-generators/podman-user-generator' ||
+	die "no working podman user generator in the guest; the shim links it to
+	$GUEST_QUADLET, which is not there — check the podman dist installation"
+
+rm -rf "$WORK"
+
+# --- 4. deploy ---------------------------------------------------------------
+
+# The account layout knobs: SERVICE_USER=podman makes deploy.sh derive the
+# podman group and rewrite the overwatch unit's Group= and the tmpfiles entry
+# to it, and QUADLET_DIR puts the units where this guest's generator looks.
+# The rest are the appliance paths — an immutable /usr has no room for either
+# binary.
+log "running the bundle's deploy.sh in the guest (this pulls images; it takes a while)"
+tn_ssh "cd $STAGE && sudo env \
+	SERVICE_USER=podman \
+	QUADLET_DIR=$GUEST_QUADLET_DIR \
+	PODMAN=$GUEST_PODMAN \
+	OVERWATCH_BIN=$GUEST_OVERWATCH \
+	DOCS_DIR=$GUEST_DOCS \
+	./deploy.sh"
+
+# --- 5. the GUI, from outside the guest --------------------------------------
+
+# deploy.sh already waited for web-gui.service inside the guest; this is the
+# rest of the path — the port forward and the container's own listener — and
+# it is still worth a wait of its own, because a unit reports active a little
+# before the application answers.
+GUI_URL="http://$TRUENAS_HOST:$TRUENAS_PORT_GUI"
+log "waiting for the GUI on $GUI_URL"
+ok=
+for _ in $(seq 60); do
+	if curl -fs -o /dev/null --max-time 5 "$GUI_URL"; then
+		ok=1
+		break
+	fi
+	sleep 5
+done
+# Quoted so the paste survives: the uid has to be looked up in the guest, and
+# an unquoted \$(...) would be expanded by the operator's own shell instead.
+[ -n "$ok" ] || die "no answer from $GUI_URL after 300s; look at the stack with:
+	ssh -p $TRUENAS_PORT_SSH truenas_admin@$TRUENAS_HOST \\
+		'sudo runuser -u podman -- env XDG_RUNTIME_DIR=/run/user/\$(id -u podman) systemctl --user list-units \"hirame*\"'"
+
+log "hirame is up on $GUI_URL"
+tn_port_table
