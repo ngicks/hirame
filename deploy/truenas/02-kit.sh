@@ -246,10 +246,64 @@ ensure_documents() {
 
 # ---------------------------------------------------------------------------
 
+# The golden image boots with the ssh service disabled and password ssh login
+# switched off for truenas_admin; the middleware REST API on the forwarded UI
+# port is the only door initially open. Turn ssh on through it (idempotent)
+# before anything below tries the ssh path.
+api() { # api <method> <path> [json_body]
+	local method=$1 path=$2 body=${3-}
+	curl -ksf -m 30 -u "truenas_admin:$TRUENAS_ADMIN_PASSWORD" \
+		-X "$method" -H 'Content-Type: application/json' \
+		${body:+-d "$body"} \
+		"https://$TRUENAS_HOST:$TRUENAS_PORT_HTTPS/api/v2.0/$path"
+}
+
+ensure_ssh_reachable() {
+	log "waiting for the middleware UI on $TRUENAS_HOST:$TRUENAS_PORT_HTTPS ..."
+	local deadline=$((SECONDS + 600))
+	until api GET system/info >/dev/null 2>&1; do
+		[ "$SECONDS" -lt "$deadline" ] ||
+			die "middleware UI not answering on https://$TRUENAS_HOST:$TRUENAS_PORT_HTTPS after 600s; is the VM up (01-vm.sh status)?"
+		sleep 5
+	done
+
+	local user_json user_id svc_json
+	user_json=$(api GET "user?username=truenas_admin") ||
+		die "middleware REST refused truenas_admin with TRUENAS_ADMIN_PASSWORD"
+	user_id=$(jq -r '.[0].id' <<<"$user_json")
+	if [ "$(jq -r '.[0].ssh_password_enabled' <<<"$user_json")" != true ]; then
+		log "enabling password ssh login for truenas_admin"
+		api PUT "user/id/$user_id" '{"ssh_password_enabled": true}' >/dev/null ||
+			die "could not enable password ssh login for truenas_admin"
+	fi
+	# Everything after this preflight runs `sudo midclt` over a tty-less ssh
+	# channel, where a sudo password prompt can only hang or fail.
+	if [ "$(jq -r '.[0].sudo_commands_nopasswd | index("ALL")' <<<"$user_json")" = null ]; then
+		log "granting truenas_admin passwordless sudo"
+		api PUT "user/id/$user_id" '{"sudo_commands_nopasswd": ["ALL"]}' >/dev/null ||
+			die "could not grant truenas_admin passwordless sudo"
+	fi
+
+	svc_json=$(api GET "service?service=ssh")
+	if [ "$(jq -r '.[0].enable' <<<"$svc_json")" != true ]; then
+		log "enabling the ssh service"
+		api PUT "service/id/$(jq -r '.[0].id' <<<"$svc_json")" '{"enable": true}' >/dev/null ||
+			die "could not enable the ssh service"
+	fi
+	if [ "$(jq -r '.[0].state' <<<"$svc_json")" != RUNNING ]; then
+		log "starting the ssh service"
+		api POST service/start '{"service": "ssh"}' >/dev/null ||
+			die "could not start the ssh service"
+	fi
+}
+
 preflight() {
 	command -v jq >/dev/null ||
 		die "required command not found: jq (middleware replies are parsed here, not in the guest)"
+	command -v curl >/dev/null ||
+		die "required command not found: curl (used to switch ssh on through the middleware REST API)"
 
+	ensure_ssh_reachable
 	tn_wait_ssh
 
 	# One call that exercises the whole chain at once -- ssh, the password, and

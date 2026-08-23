@@ -39,16 +39,19 @@ DIST_TOOL_HINT='podman-static-dist is the Go tool github.com/ngicks/dotfiles/too
       CGO_ENABLED=0 go install github.com/ngicks/dotfiles/tool/podman-static-dist/cmd/podman-static-dist@latest'
 
 # The guest-side twin of deploy/deploy.sh's as_service: same two variables, same
-# reason. The cd is root's rather than podman's — the ssh session lands in
-# truenas_admin's home, which podman cannot enter, and rootless podman re-execs
-# itself into whatever working directory it inherits. Everything after `sh -c`
-# is quoted twice over because it is parsed twice: once by the login shell, then
-# again by that sh.
+# reason. systemd-run rather than runuser because TrueNAS's sudoers carries
+# `Defaults log_subcmds`, whose intercept machinery kills podman's
+# /proc/self/exe re-exec anywhere below sudo in the process tree — systemd-run
+# hands the payload to PID 1, outside that tree. The working directory matters:
+# the ssh session lands in truenas_admin's home, which podman cannot enter, and
+# rootless podman re-execs itself into whatever working directory it inherits.
 as_podman() { # as_podman <cmd> [arg...] -- run one command as the podman user
-	local inner
-	inner="cd$(tn_quote "$GUEST_HOME") && exec runuser -u$(tn_quote "$GUEST_USER") -- env"
-	tn_run sudo sh -c "$inner$(tn_quote \
-		"HOME=$GUEST_HOME" "XDG_RUNTIME_DIR=/run/user/$GUEST_UID" "$@")"
+	tn_run sudo systemd-run --wait --pipe --collect --quiet \
+		--property=User="$GUEST_USER" \
+		--property=WorkingDirectory="$GUEST_HOME" \
+		--setenv=HOME="$GUEST_HOME" \
+		--setenv=XDG_RUNTIME_DIR="/run/user/$GUEST_UID" \
+		-- "$@"
 }
 
 # --- what gets shipped -------------------------------------------------------
@@ -157,11 +160,23 @@ install_dist() {
 	# as podman, not as the account that uploaded it.
 	tn_run sudo chmod 0644 "$staged_tar"
 
-	# No --tag: the artifact stamps its own, so the `current` symlink always
-	# names the version actually installed. Re-installing the same tag extracts
-	# over the existing tree and re-links, which is why a re-run is safe.
+	# extract + link rather than the tool's one-shot install: install's final
+	# step wires the quadlet generator into /etc with sudo, which the podman
+	# account does not have — and on this appliance must not have. On TrueNAS
+	# the generator symlink is owned by the boot-persistence shim anyway, since
+	# anything written into /etc by hand is regenerated away at the next boot.
+	# --skip-systemd leaves exactly that step out; the home-side links (config,
+	# environment.d, user units, the `current` symlink) are still made.
+	# No --tag on extract: the artifact stamps its own, so the tree always
+	# names the version actually installed; link is then pointed at that stamp.
+	# Re-running extracts over the existing tree and relinks, which is why a
+	# re-run is safe.
 	log "installing the distribution under $GUEST_HOME/$DIST_SUBDIR"
-	as_podman "$tool_dst" --log=text install --tar "$staged_tar"
+	as_podman "$tool_dst" --log=text extract --tar "$staged_tar"
+	local tag
+	tag=$(as_podman sh -c "ls -1t '$GUEST_HOME/$DIST_SUBDIR' | grep -v '^current\$' | head -1")
+	[ -n "$tag" ] || die "no dist tree appeared under $GUEST_HOME/$DIST_SUBDIR after extract"
+	as_podman "$tool_dst" --log=text link --skip-systemd --tag "$tag"
 
 	# Routes quadlet's unit search at the two directories the deployment
 	# installs units into; it sorts after the distribution's own 50-podman.conf

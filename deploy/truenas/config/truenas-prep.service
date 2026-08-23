@@ -2,7 +2,9 @@
 # boot, which throws away the subuid/subgid entries and the user generator
 # symlink that rootless podman needs. This unit puts them back, and orders
 # itself before any user manager starts so the podman user's session already
-# sees them.
+# sees them. The regeneration can also land again later in the boot (observed
+# on 25.10), so truenas-prep.path watches the files and re-triggers this unit
+# when they are rewritten.
 
 [Unit]
 Description=Restore the podman user prerequisites TrueNAS wipes from /etc at boot
@@ -10,7 +12,8 @@ Before=user@.service systemd-user-sessions.service
 
 [Service]
 Type=oneshot
-RemainAfterExit=yes
+# No RemainAfterExit: the companion path unit can only re-trigger a unit that
+# has gone inactive again.
 ExecStart=/var/lib/hirame-deploy/truenas-prep.sh
 
 [Install]

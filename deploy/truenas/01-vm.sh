@@ -72,6 +72,12 @@ domain_xml() {
     <type arch='x86_64' machine='pc'>hvm</type>
     <boot dev='hd'/>
   </os>
+  <!-- Without an explicit features block libvirt runs the machine with
+       acpi=off, and this guest's kernel hangs early in boot without ACPI. -->
+  <features>
+    <acpi/>
+    <apic/>
+  </features>
   <cpu mode='host-passthrough' check='none'/>
   <clock offset='utc'/>
   <on_poweroff>destroy</on_poweroff>

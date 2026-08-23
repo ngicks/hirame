@@ -97,6 +97,25 @@ tn_scp "$WORK/bundle.tar" "truenas_admin@$TRUENAS_HOST:$STAGE/bundle.tar"
 rm -f "$WORK/bundle.tar"
 tn_ssh "tar -xf $STAGE/bundle.tar -C $STAGE && rm -f $STAGE/bundle.tar"
 
+# deploy.sh's DOCS_DIR knob creates the directory and grants group access, but
+# the path itself is baked into overwatch.json, hirame.env and the two
+# Volume= lines — an edit deploy/README.md ("Where things go") leaves to the
+# operator. This is that edit, applied to the just-unpacked bundle. The same
+# host path is kept on both sides of Volume= because the indexer records host
+# paths and the search side must resolve the identical strings.
+log "pointing the bundle's documents path at $GUEST_DOCS"
+tn_ssh "grep -rl /srv/documents \
+	$STAGE/config/overwatch.json $STAGE/config/hirame.env.template \
+	$STAGE/quadlet/search-api.container $STAGE/quadlet/indexer.container \
+	| xargs -r sed -i 's|/srv/documents|$GUEST_DOCS|g'"
+# A config already installed by an earlier run is deliberately kept by
+# deploy.sh; one still pointing at the shipped default is ours to heal, not
+# operator tuning to preserve.
+tn_ssh "for f in /etc/hirame/overwatch.json $GUEST_HOME/.config/hirame/hirame.env; do
+	sudo test -e \$f && sudo grep -q /srv/documents \$f &&
+		sudo sed -i 's|/srv/documents|$GUEST_DOCS|g' \$f || true
+done"
+
 # --- 3. the /etc persistence shim --------------------------------------------
 
 # The range is settled once, here, and baked into the shim: the shim then
@@ -141,25 +160,33 @@ sed -e "s|@SUBUID_LINE@|$SUBID_LINE|" \
 
 log "installing the boot-persistence shim"
 tn_scp "$WORK/truenas-prep.sh" "$HERE/config/truenas-prep.service" \
+	"$HERE/config/truenas-prep.path" "$HERE/config/truenas-prep.timer" \
 	"truenas_admin@$TRUENAS_HOST:/tmp/"
-# restart, not `enable --now`: the unit is a RemainAfterExit oneshot, so on a
-# re-run `--now` would consider an already-active unit done and leave the
-# freshly installed script unexecuted.
+# restart, not `enable --now`: on a re-run `--now` considers a unit that ran
+# this boot done and would leave the freshly installed script unexecuted. The
+# path unit rides along because TrueNAS rewrites /etc/subuid and /etc/subgid
+# again later in the boot (observed on 25.10), after the boot-ordered service
+# already ran — the watch re-applies the entries whenever that happens.
 tn_ssh sudo sh <<'EOF'
 set -e
 install -d -m 0755 /var/lib/hirame-deploy
 install -m 0755 /tmp/truenas-prep.sh /var/lib/hirame-deploy/truenas-prep.sh
 install -m 0644 /tmp/truenas-prep.service /etc/systemd/system/truenas-prep.service
-rm -f /tmp/truenas-prep.sh /tmp/truenas-prep.service
+install -m 0644 /tmp/truenas-prep.path /etc/systemd/system/truenas-prep.path
+install -m 0644 /tmp/truenas-prep.timer /etc/systemd/system/truenas-prep.timer
+rm -f /tmp/truenas-prep.sh /tmp/truenas-prep.service /tmp/truenas-prep.path /tmp/truenas-prep.timer
 systemctl daemon-reload
-systemctl enable truenas-prep.service
+systemctl enable truenas-prep.service truenas-prep.path truenas-prep.timer
 systemctl restart truenas-prep.service
+systemctl restart truenas-prep.path truenas-prep.timer
 EOF
 
-state=$(tn_ssh 'systemctl is-active truenas-prep.service' 2>/dev/null || true)
-[ "$state" = active ] || {
+# A plain oneshot goes back to inactive on success (it must, for the path
+# unit to be able to re-trigger it), so the outcome is read from Result.
+state=$(tn_ssh 'systemctl show -p Result --value truenas-prep.service' 2>/dev/null || true)
+[ "$state" = success ] || {
 	tn_ssh 'systemctl --no-pager status truenas-prep.service' || true
-	die "truenas-prep.service is '$state', not active"
+	die "truenas-prep.service result is '$state', not success"
 }
 # What the shim was installed for, read back rather than assumed: without
 # these two deploy.sh's own preflight stops the deployment, and rootless
@@ -171,11 +198,30 @@ for f in /etc/subuid /etc/subgid; do
 	grep -qxF "$SUBID_LINE" <<<"$content" ||
 		die "$f does not carry '$SUBID_LINE' after truenas-prep.service ran"
 done
-tn_ssh 'test -x /etc/systemd/user-generators/podman-user-generator' ||
+# sudo: the symlink target sits under the podman user's 0700 home, which the
+# ssh account cannot traverse — an unprivileged test -x would fail on a
+# perfectly healthy link.
+tn_ssh 'sudo test -x /etc/systemd/user-generators/podman-user-generator' ||
 	die "no working podman user generator in the guest; the shim links it to
 	$GUEST_QUADLET, which is not there — check the podman dist installation"
 
 rm -rf "$WORK"
+
+# The podman user's first podman run predates the subuid/subgid lines the shim
+# just wrote (the previous script starts podman to verify itself), so its user
+# namespace still carries the fallback single mapping — under which every
+# container fails with "setresgid: Invalid argument". migrate tears the stale
+# pause process down; podman then picks the ranges up on next use. Idempotent.
+# systemd-run for the same log_subcmds reason as the deploy run below, and the
+# dist PATH because podman resolves crun/conmon from it.
+log "refreshing the podman user namespace mapping (podman system migrate)"
+tn_ssh "sudo systemd-run --wait --pipe --collect --quiet \
+	--property=User=podman \
+	--property=WorkingDirectory=$GUEST_HOME \
+	--setenv=HOME=$GUEST_HOME \
+	--setenv=XDG_RUNTIME_DIR=/run/user/\$(id -u podman) \
+	--setenv=PATH=$GUEST_DIST/usr/local/bin:/usr/bin:/bin \
+	-- $GUEST_PODMAN system migrate"
 
 # --- 4. deploy ---------------------------------------------------------------
 
@@ -185,13 +231,19 @@ rm -rf "$WORK"
 # The rest are the appliance paths — an immutable /usr has no room for either
 # binary.
 log "running the bundle's deploy.sh in the guest (this pulls images; it takes a while)"
-tn_ssh "cd $STAGE && sudo env \
+# systemd-run, not plain sudo: TrueNAS's sudoers carries `Defaults
+# log_subcmds`, whose intercept machinery kills podman's /proc/self/exe
+# re-exec anywhere below sudo in the process tree, and deploy.sh drives podman
+# throughout. systemd-run hands the run to PID 1, outside that tree.
+tn_ssh "sudo systemd-run --wait --pipe --collect --quiet \
+	--property=WorkingDirectory=$STAGE \
+	-- env \
 	SERVICE_USER=podman \
 	QUADLET_DIR=$GUEST_QUADLET_DIR \
 	PODMAN=$GUEST_PODMAN \
 	OVERWATCH_BIN=$GUEST_OVERWATCH \
 	DOCS_DIR=$GUEST_DOCS \
-	./deploy.sh"
+	$STAGE/deploy.sh"
 
 # --- 5. the GUI, from outside the guest --------------------------------------
 

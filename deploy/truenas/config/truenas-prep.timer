@@ -1,0 +1,16 @@
+# The path unit reacts to /etc/subuid and /etc/subgid being rewritten, but an
+# edge is lost when TrueNAS rewrites the second file while the shim is already
+# running for the first (observed on 25.10: the two rewrites land in one
+# burst). This timer is the sweep behind that race: the shim is a no-op when
+# the entries are in place, so the periodic run costs nothing and heals a lost
+# edge within one interval.
+[Unit]
+Description=Periodic sweep for the podman user prerequisites in /etc
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=2min
+Unit=truenas-prep.service
+
+[Install]
+WantedBy=timers.target

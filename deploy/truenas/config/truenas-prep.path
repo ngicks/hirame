@@ -1,0 +1,16 @@
+# TrueNAS regenerates /etc/subuid and /etc/subgid from its config database
+# not only at boot but again while the system is coming up (and on config
+# changes), which can land AFTER truenas-prep.service already ran and wipe
+# the podman entries it wrote. Watching the files and re-running the shim
+# whenever they are replaced closes that window. No loop: the shim only
+# writes when an entry is missing, so its own run does not re-trigger this.
+[Unit]
+Description=Re-apply podman user prerequisites when TrueNAS rewrites /etc
+
+[Path]
+PathChanged=/etc/subuid
+PathChanged=/etc/subgid
+Unit=truenas-prep.service
+
+[Install]
+WantedBy=multi-user.target
