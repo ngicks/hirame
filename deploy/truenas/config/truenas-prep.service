@@ -1,0 +1,17 @@
+# TrueNAS rebuilds much of /etc from its own configuration database on every
+# boot, which throws away the subuid/subgid entries and the user generator
+# symlink that rootless podman needs. This unit puts them back, and orders
+# itself before any user manager starts so the podman user's session already
+# sees them.
+
+[Unit]
+Description=Restore the podman user prerequisites TrueNAS wipes from /etc at boot
+Before=user@.service systemd-user-sessions.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/var/lib/hirame-deploy/truenas-prep.sh
+
+[Install]
+WantedBy=multi-user.target
