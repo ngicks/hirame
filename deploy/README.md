@@ -240,6 +240,13 @@ Platform constraints found the hard way:
   `~/.config/containers/systemd` (an `environment.d` drop-in on the service
   user), or the generator reads only the dist's own unit directory.
 
+All of that is scripted for one appliance in `deploy/truenas/`, against a
+TrueNAS SCALE 25.10 VM built from a golden qcow2 image. `01-vm.sh up` →
+`02-kit.sh` → `03-podman.sh` → `04-deploy.sh`, run in that order, allocate the
+VM, kit its pool and accounts, install the static podman dist, and deploy the
+stack into it; nothing but `TRUENAS_ADMIN_PASSWORD` — or its default — has to
+be exported. Each script's header lists what it assumes and the knobs it reads.
+
 ### 1. The service user
 
 ```sh

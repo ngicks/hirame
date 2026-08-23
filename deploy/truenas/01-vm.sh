@@ -10,6 +10,7 @@
 #   01-vm.sh up        create the disks, define and start the domain (default)
 #   01-vm.sh down      ask the guest to shut down, wait for it
 #   01-vm.sh destroy   undefine and delete this instance's disks (asks first)
+#   01-vm.sh destroy --yes   the same, without the confirmation (automation)
 #   01-vm.sh status    domain state and the forwarded ports
 set -euo pipefail
 

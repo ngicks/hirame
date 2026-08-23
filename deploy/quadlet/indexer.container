@@ -45,7 +45,8 @@ EnvironmentFile=%h/.config/hirame/secrets.env
 # deploy/config/overwatch.json, which name the same path.
 #
 # Readable through gid 0 for the same reason the socket is: the archive is
-# group-owned by `hirame` and g+rX, and this process's host gid is that group.
+# group-owned by the service user's primary group (`hirame` by default) and
+# g+rX, and this process's host gid is that group.
 Volume=/srv/documents:/srv/documents:ro
 
 # The overwatch socket, bind-mounted from the host runtime directory
@@ -66,10 +67,11 @@ Volume=/run/overwatch/hirame:/run/overwatch/hirame:ro
 # This is the whole rootless socket handoff (D-009), and it rests on one
 # property of podman's default rootless mapping: container gid 0 maps to the
 # *primary group of the user running podman*, exactly as container uid 0 maps
-# to that user. So gid 0 here is the host `hirame` group — and
-# deploy/systemd/overwatch.service runs the daemon with Group=hirame, which
-# makes its runtime directory root:hirame 0750 and its socket root:hirame 0660.
-# Group r-x traverses the directory, group rw- connects to the socket.
+# to that user. So gid 0 here is the service user's primary group on the host
+# (`hirame` by default) — and deploy.sh installs overwatch.service with `Group=`
+# set to that same group, which makes its runtime directory 0750 and its socket
+# 0660, both owned root:<that group>. Group r-x traverses the directory, group
+# rw- connects to the socket.
 #
 # The container's *uid* has no part in it: 10001 maps to a subuid
 # (subuid_start + 10000) that owns nothing on the host. Which is why

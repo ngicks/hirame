@@ -179,6 +179,7 @@ sed -e "s|/usr/local/bin/overwatch|$OVERWATCH_BIN|g" \
 	-e "s|^Group=hirame$|Group=$SERVICE_GROUP|" \
 	"$HERE/systemd/overwatch.service" >/etc/systemd/system/overwatch.service
 chmod 0644 /etc/systemd/system/overwatch.service
+install -d -m 0755 /etc/tmpfiles.d
 # The group on the socket directory has to stay equal to the unit's Group= —
 # the conf says why — so one derived value rewrites both. The path component
 # is the deployment's name, not the account's, and stays as shipped.

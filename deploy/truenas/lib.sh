@@ -39,10 +39,11 @@ die() {
 # path component under $TRUENAS_IMAGE_DIR that `01-vm.sh destroy` removes
 # wholesale. A value carrying a slash or a `..` would aim that removal at a
 # directory outside the image tree, so it is rejected here rather than guarded
-# for at each use.
+# for at each use. A leading dash is out for a second reason: it would reach
+# virsh as an option rather than as a domain name.
 case "$TRUENAS_VM_NAME" in
-.* | *[!A-Za-z0-9._-]*)
-	die "TRUENAS_VM_NAME must be letters, digits, dot, dash or underscore and must not start with a dot: '$TRUENAS_VM_NAME'"
+.* | -* | *[!A-Za-z0-9._-]*)
+	die "TRUENAS_VM_NAME must be letters, digits, dot, dash or underscore and must not start with a dot or a dash: '$TRUENAS_VM_NAME'"
 	;;
 esac
 
@@ -50,10 +51,11 @@ esac
 # destroy` a single subtree removal instead of a list of file names.
 TRUENAS_INSTANCE_DIR=$TRUENAS_IMAGE_DIR/$TRUENAS_VM_NAME
 
-# The VM is disposable and reached over a port forwarded on the loopback
-# interface: its host key changes with every destroy/up cycle and nothing sits
-# on that path to impersonate it, so key checking could only ever produce false
-# alarms an operator would learn to click through.
+# The VM is a throwaway test appliance: its host key changes with every
+# destroy/up cycle, so pinning would raise a mismatch on each fresh instance —
+# an alarm an operator would learn to click through. There is nothing to
+# protect either, the account being truenas_admin with a password baked into
+# the golden image and known to everyone who can read this file.
 #
 # PubkeyAuthentication=no because this login is password-only; without it an
 # operator with a populated ssh-agent can exhaust the server's auth attempts on
@@ -93,6 +95,23 @@ tn_ssh() { # tn_ssh <cmd...>
 		DISPLAY="${DISPLAY:-:0}" \
 		ssh "${TN_SSH_OPTS[@]}" -p "$TRUENAS_PORT_SSH" \
 		"truenas_admin@$TRUENAS_HOST" "$@"
+}
+
+# A command handed to ssh is re-parsed by a login shell in the guest, so every
+# argument is wrapped for that second pass. midclt payloads are JSON documents
+# full of braces, quotes and commas, and paths may hold spaces; without this
+# they would arrive split into pieces or glob-expanded. Plain single quotes
+# rather than bash's ${var@Q}, because truenas_admin's login shell is not
+# necessarily bash.
+tn_quote() {
+	local arg
+	for arg in "$@"; do
+		printf " '%s'" "${arg//\'/\'\\\'\'}"
+	done
+}
+
+tn_run() { # tn_run <cmd> [arg...] -- run one command in the guest
+	tn_ssh "$(tn_quote "$@")"
 }
 
 # tn_scp <src...> <dest>; name the remote side in full, e.g.

@@ -12,8 +12,11 @@
 # pinned to that release's middleware API. A different golden image means
 # re-checking each call, not just the constants.
 #
-# Safe to re-run: every object is queried before it is created, and state that
-# is already there is never replaced.
+# Safe to re-run: every create is guarded by a query and skipped when the object
+# is already there. The grants are the exception — ownership and permissions on
+# the homes and on the documents directory are re-asserted on every run, because
+# those are what the rest of the deployment depends on and a wrong one fails far
+# away from here.
 set -euo pipefail
 
 . "$(cd "$(dirname "$0")" && pwd)/lib.sh"
@@ -40,23 +43,6 @@ CHANGED=0
 # ---------------------------------------------------------------------------
 # guest access
 # ---------------------------------------------------------------------------
-
-# A command handed to ssh is re-parsed by a login shell in the guest, so every
-# argument is wrapped for that second pass. midclt payloads are JSON documents
-# full of braces, quotes and commas, and paths may hold spaces; without this
-# they would arrive split into pieces or glob-expanded. Plain single quotes
-# rather than bash's ${var@Q}, because truenas_admin's login shell is not
-# necessarily bash.
-tn_quote() {
-	local arg
-	for arg in "$@"; do
-		printf " '%s'" "${arg//\'/\'\\\'\'}"
-	done
-}
-
-tn_run() { # tn_run <cmd> [arg...] -- run one command in the guest
-	tn_ssh "$(tn_quote "$@")"
-}
 
 mid() { # mid <method> [json_arg...] -- middleware call, reply on stdout
 	tn_run sudo midclt call "$@"

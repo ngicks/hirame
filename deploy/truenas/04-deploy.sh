@@ -33,7 +33,7 @@ IMAGES="hirame-search-api hirame-web-gui gahaku"
 GUEST_HOME=/mnt/tank/home/podman
 GUEST_DIST=$GUEST_HOME/.local/share/podman-dist/current
 GUEST_PODMAN=$GUEST_DIST/usr/local/bin/podman
-GUEST_QUADLET=$GUEST_DIST/usr/local/lib/podman/quadlet
+GUEST_QUADLET=$GUEST_DIST/usr/local/libexec/podman/quadlet
 # The second entry of the dist's QUADLET_UNIT_DIRS, so the user generator
 # finds the units deploy.sh installs; the first entry belongs to the dist.
 GUEST_QUADLET_DIR=$GUEST_HOME/.config/containers-quadlet-additional
@@ -89,8 +89,8 @@ WORK=$(mktemp -d) || die "could not create a temporary directory"
 log "packing $DIST"
 tar -C "$DIST" -cf "$WORK/bundle.tar" .
 
-# Uncompressed: the transfer is a loopback port forward, where compressing
-# 700 MiB costs more than it saves.
+# Uncompressed: the transfer is a port forward into a VM on this same host,
+# where compressing 700 MiB costs more than it saves.
 log "shipping the bundle to $STAGE ($(du -h "$WORK/bundle.tar" | cut -f1))"
 tn_ssh "sudo rm -rf $STAGE && sudo install -d -m 0755 -o truenas_admin $STAGE"
 tn_scp "$WORK/bundle.tar" "truenas_admin@$TRUENAS_HOST:$STAGE/bundle.tar"

@@ -44,9 +44,9 @@ EnvironmentFile=%h/.config/hirame/secrets.env
 Volume=/srv/documents:/srv/documents:ro
 
 # Same uid and gid as indexer.container, for the archive rather than for a
-# socket: under rootless podman container gid 0 is the host `hirame` group, so
-# this is what lets /srv/documents stay group-readable instead of having to be
-# world-readable. The image's own USER would be 10001:10001, whose gid maps to
+# socket: under rootless podman container gid 0 is the service user's primary
+# group on the host (`hirame` by default), so this is what lets /srv/documents
+# stay group-readable instead of having to be world-readable. The image's own USER would be 10001:10001, whose gid maps to
 # a subgid that owns nothing. deploy/README.md has the full mapping argument.
 User=10001:0
 

@@ -38,20 +38,6 @@ DIST_TOOL_HINT='podman-static-dist is the Go tool github.com/ngicks/dotfiles/too
 
       CGO_ENABLED=0 go install github.com/ngicks/dotfiles/tool/podman-static-dist/cmd/podman-static-dist@latest'
 
-# A command handed to ssh is re-parsed by a login shell in the guest, so every
-# argument is wrapped for that second pass. Plain single quotes rather than
-# bash's ${var@Q}, because truenas_admin's login shell is not necessarily bash.
-tn_quote() {
-	local arg
-	for arg in "$@"; do
-		printf " '%s'" "${arg//\'/\'\\\'\'}"
-	done
-}
-
-tn_run() { # tn_run <cmd> [arg...] -- run one command in the guest
-	tn_ssh "$(tn_quote "$@")"
-}
-
 # The guest-side twin of deploy/deploy.sh's as_service: same two variables, same
 # reason. The cd is root's rather than podman's — the ssh session lands in
 # truenas_admin's home, which podman cannot enter, and rootless podman re-execs
@@ -198,7 +184,7 @@ install_dist() {
 # --- verification ------------------------------------------------------------
 
 verify() {
-	local rc=0 out quadlet
+	local rc=0 out quadlet quadlet_bin
 
 	log "verifying"
 	if out=$(as_podman "$GUEST_HOME/$DIST_SUBDIR/current/usr/local/bin/podman" info 2>&1); then
@@ -206,6 +192,18 @@ verify() {
 	else
 		printf '%s\n' "$out" >&2
 		log "  FAIL  podman info"
+		rc=1
+	fi
+
+	# The next script links this binary into /etc/systemd/user-generators and
+	# bakes its path into the boot shim, so a distribution that keeps it
+	# somewhere else has to be caught here: past this point the failure surfaces
+	# as units that are simply never generated.
+	quadlet_bin=$GUEST_HOME/$DIST_SUBDIR/current/usr/local/libexec/podman/quadlet
+	if as_podman test -x "$quadlet_bin" >/dev/null 2>&1; then
+		log "  ok    $quadlet_bin"
+	else
+		log "  FAIL  no executable quadlet binary at $quadlet_bin"
 		rc=1
 	fi
 
