@@ -14,8 +14,7 @@
 # and want re-checking against a different golden image.
 #
 # Re-running is safe and is the upgrade path: the artifact re-extracts over its
-# own tag, the environment file is rewritten with the same content, and linger
-# is already on.
+# own tag, link relinks idempotently, and linger is already on.
 #
 #   03-podman.sh
 #
@@ -102,9 +101,6 @@ preflight_local() {
     build one with 'podman-static-dist build', or point PODMAN_STATIC_TAR at it"
 	fi
 
-	CONF=$HERE/config/75-podman.conf
-	[ -f "$CONF" ] || die "missing $CONF"
-
 	log "tool     $DIST_TOOL"
 	log "artifact $TAR"
 }
@@ -143,11 +139,10 @@ start_user_manager() {
 
 install_dist() {
 	log "copying the tool and the artifact to the guest"
-	tn_scp "$DIST_TOOL" "$TAR" "$CONF" "truenas_admin@$TRUENAS_HOST:/tmp/"
+	tn_scp "$DIST_TOOL" "$TAR" "truenas_admin@$TRUENAS_HOST:/tmp/"
 
 	local staged_tool=/tmp/${DIST_TOOL##*/}
 	local staged_tar=/tmp/${TAR##*/}
-	local staged_conf=/tmp/${CONF##*/}
 	local tool_dst=$GUEST_HOME/.local/bin/podman-static-dist
 
 	# /tmp is fine to read the artifact out of, but not to run the tool from:
@@ -188,16 +183,8 @@ install_dist() {
 	fi
 	as_podman "$tool_dst" --log=text link --skip-systemd --tag "$tag"
 
-	# Routes quadlet's unit search at the two directories the deployment
-	# installs units into; it sorts after the distribution's own 50-podman.conf
-	# so it wins the variable.
-	log "installing 75-podman.conf"
-	as_podman mkdir -p "$GUEST_HOME/.config/environment.d"
-	tn_run sudo install -o "$GUEST_USER" -g "$GUEST_GROUP" -m 0644 \
-		"$staged_conf" "$GUEST_HOME/.config/environment.d/75-podman.conf"
-
 	# /tmp is RAM on the appliance and the artifact is not small.
-	tn_run rm -f "$staged_tool" "$staged_tar" "$staged_conf"
+	tn_run rm -f "$staged_tool" "$staged_tar"
 
 	# environment.d is turned into manager environment by a systemd environment
 	# generator, and generators re-run on reload — so the file just written
@@ -232,18 +219,18 @@ verify() {
 		rc=1
 	fi
 
-	# The distribution's own 50-podman.conf already sets QUADLET_UNIT_DIRS, so
-	# the value is checked and not merely the name: only 75-podman.conf adds the
-	# -additional directory, which makes it the evidence that it took effect.
+	# QUADLET_UNIT_DIRS comes from the distribution's 50-podman.conf, which
+	# link wires into ~/.config/environment.d — so its value in the manager
+	# environment is the evidence that the environment.d linking took effect.
 	if ! out=$(as_podman systemctl --user show-environment 2>&1); then
 		printf '%s\n' "$out" >&2
 		log "  FAIL  systemctl --user show-environment"
 		rc=1
 	elif quadlet=$(printf '%s\n' "$out" | grep '^QUADLET_UNIT_DIRS='); then
 		case "$quadlet" in
-		*containers-quadlet-additional*) log "  ok    $quadlet" ;;
+		*containers-quadlet*) log "  ok    $quadlet" ;;
 		*)
-			log "  FAIL  $quadlet does not include the additional unit directory"
+			log "  FAIL  $quadlet does not include the containers-quadlet directory"
 			rc=1
 			;;
 		esac

@@ -34,9 +34,9 @@ GUEST_HOME=/mnt/tank/home/podman
 GUEST_DIST=$GUEST_HOME/.local/share/podman-dist/current
 GUEST_PODMAN=$GUEST_DIST/usr/local/bin/podman
 GUEST_QUADLET=$GUEST_DIST/usr/local/libexec/podman/quadlet
-# The second entry of the dist's QUADLET_UNIT_DIRS, so the user generator
-# finds the units deploy.sh installs; the first entry belongs to the dist.
-GUEST_QUADLET_DIR=$GUEST_HOME/.config/containers-quadlet-additional
+# The dist's QUADLET_UNIT_DIRS entry (from its 50-podman.conf), so the user
+# generator finds the units deploy.sh installs there.
+GUEST_QUADLET_DIR=$GUEST_HOME/.config/containers-quadlet
 GUEST_DOCS=/mnt/tank/share/documents
 GUEST_OVERWATCH=/var/lib/overwatch/overwatch
 # The bundle is unpacked on the pool: it carries some 700 MiB of image
