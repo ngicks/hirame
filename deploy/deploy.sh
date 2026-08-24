@@ -13,7 +13,7 @@
 #	sudo ./deploy.sh                          inside a build.sh bundle
 #
 # Re-running is safe and is the redeploy path: code is always refreshed (the
-# overwatch binary, every unit, the three images) and configuration is never
+# overwatch binary, every unit, every image) and configuration is never
 # clobbered (overwatch.json, hirame.env, postgresql.conf, secrets.env are
 # installed only if absent) — delete a file to have it regenerated. On a
 # re-run with the pod already up, migrations are re-run and the applications
@@ -72,6 +72,18 @@ as_service() {
 			"$@")
 }
 
+# The bundle carries every image the units name, registry ones included, so
+# that nothing here reaches a registry — the host may have no outbound network
+# at all. The units' own Image= lines say which those are; build.sh derives the
+# list and the archive names with these same two expressions, so there is no
+# second list on either side to keep in step with the units.
+external_images() { # <quadlet dir>
+	grep -rh '^Image=' "$1" | sed -e '/^Image=localhost\//d' -e 's/^Image=//' | sort -u
+}
+image_archive() { # <image ref>
+	printf '%s.tar\n' "${1//[\/:]/_}"
+}
+
 # --- preflight ---------------------------------------------------------------
 
 [ "$(id -u)" -eq 0 ] || die "run as root: sudo $0"
@@ -81,6 +93,11 @@ as_service() {
 for name in $IMAGES; do
 	[ -f "$ART/images/$name.tar" ] ||
 		die "no $name image archive in $ART/images; run deploy/build.sh first"
+done
+EXTERNAL_IMAGES=$(external_images "$HERE/quadlet")
+for ref in $EXTERNAL_IMAGES; do
+	[ -f "$ART/images/$(image_archive "$ref")" ] ||
+		die "no archive for $ref in $ART/images; run deploy/build.sh first"
 done
 
 for cmd in "$PODMAN" openssl runuser loginctl systemctl usermod awk; do
@@ -221,6 +238,12 @@ for name in $IMAGES; do
 	as_service "$PODMAN" image exists "localhost/$name:latest" ||
 		die "$ART/images/$name.tar did not carry the tag localhost/$name:latest"
 done
+for ref in $EXTERNAL_IMAGES; do
+	log "loading $ref"
+	as_service "$PODMAN" load --quiet <"$ART/images/$(image_archive "$ref")"
+	as_service "$PODMAN" image exists "$ref" ||
+		die "$ART/images/$(image_archive "$ref") did not carry the tag $ref"
+done
 
 # Catches unit syntax errors before an install does. Checked where podman
 # ships it and next to a non-default $PODMAN (static dists); skipped rather
@@ -300,8 +323,9 @@ else
 	as_service systemctl --user start hirame-pod.service
 fi
 
-# Generous: the first start pulls the external images (ParadeDB, Tika,
-# VersityGW) before anything can become healthy.
+# Generous: nothing is pulled any more, but the first start still initialises
+# the database, runs every migration, and cold-starts the whole pod before
+# anything can become healthy.
 ok=
 for _ in $(seq 300); do
 	if as_service systemctl --user is-active --quiet web-gui.service; then

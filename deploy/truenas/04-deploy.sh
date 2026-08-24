@@ -27,6 +27,17 @@ REPO=$(cd "$HERE/../.." && pwd)
 DIST=$REPO/deploy/dist
 IMAGES="hirame-search-api hirame-web-gui gahaku"
 
+# The bundle carries the pinned registry images as well, because the guest is
+# not guaranteed a route to docker.io. Which those are is derived from the
+# units, exactly as build.sh and deploy.sh derive it, so this check cannot
+# describe a bundle different from the one they build and load.
+external_images() { # <quadlet dir>
+	grep -rh '^Image=' "$1" | sed -e '/^Image=localhost\//d' -e 's/^Image=//' | sort -u
+}
+image_archive() { # <image ref>
+	printf '%s.tar\n' "${1//[\/:]/_}"
+}
+
 # The guest layout the earlier scripts created. The home is on the pool
 # because /home is mounted noexec there and rootless podman execs its helpers
 # out of ~/.local.
@@ -39,7 +50,7 @@ GUEST_QUADLET=$GUEST_DIST/usr/local/libexec/podman/quadlet
 GUEST_QUADLET_DIR=$GUEST_HOME/.config/containers-quadlet
 GUEST_DOCS=/mnt/tank/share/documents
 GUEST_OVERWATCH=/var/lib/overwatch/overwatch
-# The bundle is unpacked on the pool: it carries some 700 MiB of image
+# The bundle is unpacked on the pool: it carries several GiB of image
 # archives, and the pool is both the roomy filesystem in that guest and an
 # exec one, which running deploy.sh out of the unpacked bundle needs.
 STAGE=/mnt/tank/hirame-deploy
@@ -52,12 +63,18 @@ command -v curl >/dev/null ||
 if [ "${SKIP_BUILD:-}" = 1 ]; then
 	log "SKIP_BUILD=1: shipping $DIST as it stands"
 	# The same artifacts deploy.sh refuses to start without, checked here so a
-	# half-built dist fails before 700 MiB goes over the wire.
+	# half-built dist fails before the whole bundle goes over the wire.
 	[ -x "$DIST/deploy.sh" ] && [ -x "$DIST/overwatch" ] && [ -f "$DIST/quadlet/hirame.pod" ] ||
 		die "$DIST is not a complete bundle; unset SKIP_BUILD to build it"
 	for name in $IMAGES; do
 		[ -f "$DIST/images/$name.tar" ] ||
 			die "no $DIST/images/$name.tar; unset SKIP_BUILD to build it"
+	done
+	EXTERNAL_IMAGES=$(external_images "$DIST/quadlet")
+	for ref in $EXTERNAL_IMAGES; do
+		[ -f "$DIST/images/$(image_archive "$ref")" ] ||
+			die "no archive for $ref in $DIST/images; the guest has no route to a
+	registry and its stack would fail to start — unset SKIP_BUILD to rebuild the bundle"
 	done
 	# A bundle built before deploy.sh grew the account knobs hardcodes the
 	# hirame user, silently ignores the SERVICE_USER passed below, and then
@@ -88,20 +105,18 @@ tn_ssh sudo -n true >/dev/null 2>&1 ||
 	die "truenas_admin cannot sudo without a password in the guest; run
 	deploy/truenas/02-kit.sh, whose preflight grants it"
 
-# No trap: lib.sh owns the EXIT trap for its askpass helper. The bundle
-# archive is removed as soon as it is across, the directory at the end.
+# No trap: lib.sh owns the EXIT trap for its askpass helper. Only the small
+# shim files land here; the directory goes at the end.
 WORK=$(mktemp -d) || die "could not create a temporary directory"
 
-log "packing $DIST"
-tar -C "$DIST" -cf "$WORK/bundle.tar" .
-
-# Uncompressed: the transfer is a port forward into a VM on this same host,
-# where compressing 700 MiB costs more than it saves.
-log "shipping the bundle to $STAGE ($(du -h "$WORK/bundle.tar" | cut -f1))"
+# Streamed, never staged: the bundle carries every image the units name and so
+# runs to several GiB, more than a tmpfs /tmp holds — and writing it out only
+# to read it back doubles the I/O for nothing. Uncompressed because the
+# transfer is a port forward into a VM on this same host, where compressing
+# that much costs more than it saves.
+log "shipping the bundle to $STAGE ($(du -sh "$DIST" | cut -f1))"
 tn_ssh "sudo rm -rf $STAGE && sudo install -d -m 0755 -o truenas_admin $STAGE"
-tn_scp "$WORK/bundle.tar" "truenas_admin@$TRUENAS_HOST:$STAGE/bundle.tar"
-rm -f "$WORK/bundle.tar"
-tn_ssh "tar -xf $STAGE/bundle.tar -C $STAGE && rm -f $STAGE/bundle.tar"
+tar -C "$DIST" -cf - . | tn_ssh "tar -xf - -C $STAGE"
 
 # deploy.sh's DOCS_DIR knob creates the directory and grants group access, but
 # the path itself is baked into overwatch.json, hirame.env and the two
@@ -249,7 +264,7 @@ tn_ssh "sudo systemd-run --wait --pipe --collect --quiet \
 # to it, and QUADLET_DIR puts the units where this guest's generator looks.
 # The rest are the appliance paths — an immutable /usr has no room for either
 # binary.
-log "running the bundle's deploy.sh in the guest (this pulls images; it takes a while)"
+log "running the bundle's deploy.sh in the guest (this loads the images; it takes a while)"
 # systemd-run, not plain sudo: TrueNAS's sudoers carries `Defaults
 # log_subcmds`, whose intercept machinery kills podman's /proc/self/exe
 # re-exec anywhere below sudo in the process tree, and deploy.sh drives podman

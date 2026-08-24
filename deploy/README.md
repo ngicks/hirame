@@ -131,6 +131,11 @@ deployment whose data was produced by the previous one.
 | `docker.io/library/node:24-bookworm-slim` + `pnpm@10.34.5` | build stage of `hirame-web-gui` |
 | `docker.io/library/golang:1.26-bookworm` + `docker.io/library/debian:bookworm-slim` | build and runtime stages of `hirame-search-api` |
 
+The registry images the units name are pulled by `deploy/build.sh` on the build host and
+saved into `deploy/dist/images/` beside the locally built ones, so that a
+deployment never has to reach docker.io. The rest are build stages and are
+needed only where the images are built.
+
 Three images are built here and published nowhere; the units name them
 `localhost/...` so a missing build fails loudly instead of pulling something
 from docker.io. Build them **as the `hirame` user**, with plain unprivileged
@@ -173,8 +178,9 @@ wants a privileged port.
 The procedure is scripted in two halves, split so the target never needs a
 toolchain or a checkout. `deploy/build.sh` runs wherever podman and go are
 installed — any user, no root, no service account — and writes a
-self-contained bundle to `deploy/dist/`: the overwatch binary, the three
-images as archives, the units and templates, and a copy of the deploy script.
+self-contained bundle to `deploy/dist/`: the overwatch binary, every image the
+units name as an archive, the units and templates, and a copy of the deploy
+script.
 Copy that one directory to the target and run the script inside it:
 
 ```sh
@@ -186,8 +192,10 @@ ssh target sudo ./hirame/deploy.sh
 `deploy.sh` does everything host-side: it creates the account, installs the
 daemon and the units, loads the images into the service user's store, and
 starts the stack. Re-running it is the redeploy path — it always refreshes
-code (the binary, every unit, the three images) and never overwrites
+code (the binary, every unit, every image) and never overwrites
 configuration or credentials it finds already installed.
+Nothing in it contacts a registry: the target may have no outbound network,
+where a stack that had to pull at first start would collapse instead.
 `sudo deploy/install.sh` runs both halves on one host. The steps below remain
 the reference for what they do and why.
 
@@ -746,8 +754,8 @@ expressed between them.
 ## Network exposure (D-010)
 
 `hirame.network` is `Internal=true`: nothing on it reaches the internet and
-nothing off the host reaches it. Image pulls are unaffected — they happen on the
-host's network before a container joins.
+nothing off the host reaches it. Images are unaffected — every one of them is
+loaded into the store from the bundle before a container joins.
 
 The single published port belongs to `hirame.pod`, and rootless is the
 arrangement in which that is least surprising: a rootless publish is

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Build a self-contained deployment bundle: the overwatch host binary, the
-# three localhost/ images saved as docker-archives, the quadlet units,
+# Build a self-contained deployment bundle: the overwatch host binary, every
+# image the quadlet units name saved as a docker-archive, the quadlet units,
 # configuration and templates, and a copy of deploy.sh. Run as any user with
 # podman and go — no root, and no service account. The target needs none of
 # that and no checkout either, only podman and systemd:
@@ -55,6 +55,34 @@ build_and_save() { # <name> <containerfile> <context>
 build_and_save hirame-search-api "$REPO/apps/search-api/Containerfile" "$REPO"
 build_and_save hirame-web-gui "$REPO/apps/web-gui/Containerfile" "$REPO/apps/web-gui"
 build_and_save gahaku "$REPO/gahaku/Dockerfile" "$REPO/gahaku"
+
+# The pinned registry images travel in the bundle too: the target may have no
+# outbound network at all, and a stack whose first start has to pull collapses
+# there in a cascade of dependency failures. The units' Image= lines are the
+# list — deploy.sh re-derives it the same way from the bundle's own copy of
+# them, so no second list exists to fall out of step with the units.
+external_images() { # <quadlet dir>
+	grep -rh '^Image=' "$1" | sed -e '/^Image=localhost\//d' -e 's/^Image=//' | sort -u
+}
+# A ref is not a filename: the registry-path slashes and the tag colon are what
+# has to go. deploy.sh derives the same names from the same refs.
+image_archive() { # <image ref>
+	printf '%s.tar\n' "${1//[\/:]/_}"
+}
+EXTERNAL_IMAGES=$(external_images "$REPO/deploy/quadlet")
+for ref in $EXTERNAL_IMAGES; do
+	# The tags are pinned, so whatever is already in the store is what a pull
+	# would fetch — and pulling is the slow half of a rebuild.
+	if "$PODMAN" image exists "$ref"; then
+		log "saving $ref (already in the store)"
+	else
+		log "pulling and saving $ref"
+		"$PODMAN" pull "$ref"
+	fi
+	archive=$OUT/images/$(image_archive "$ref")
+	rm -f "$archive"
+	"$PODMAN" save --output "$archive" "$ref"
+done
 
 # What deploy.sh installs besides the artifacts, laid out as its siblings —
 # the same relative layout it sees when run from the checkout.
