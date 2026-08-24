@@ -59,6 +59,12 @@ if [ "${SKIP_BUILD:-}" = 1 ]; then
 		[ -f "$DIST/images/$name.tar" ] ||
 			die "no $DIST/images/$name.tar; unset SKIP_BUILD to build it"
 	done
+	# A bundle built before deploy.sh grew the account knobs hardcodes the
+	# hirame user, silently ignores the SERVICE_USER passed below, and then
+	# dies deep in the guest with a permission error on podman's home. Refuse
+	# it here, where the fix (rebuild) is obvious.
+	grep -q 'SERVICE_USER' "$DIST/deploy.sh" && grep -q 'QUADLET_DIR' "$DIST/deploy.sh" ||
+		die "$DIST/deploy.sh is from before the SERVICE_USER/QUADLET_DIR knobs and would deploy as the hirame user; unset SKIP_BUILD to rebuild the bundle"
 else
 	# Both are build-host requirements only — the guest needs neither — so they
 	# are checked before build.sh gets far enough to leave a partial dist
