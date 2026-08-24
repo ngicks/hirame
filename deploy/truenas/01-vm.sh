@@ -39,9 +39,13 @@ domain_xml() {
 	local emulator="" disks="" i
 	local targets=(vdb vdc vdd)
 
-	# libvirt guesses an emulator from distro-standard paths; nix profiles and
-	# other custom prefixes are not among them, so name the one this host has.
-	if command -v qemu-system-x86_64 >/dev/null; then
+	# Only when virsh runs unescalated: then the daemon shares this shell's
+	# environment and libvirt would not find a qemu living in a nix profile or
+	# another custom prefix on its own. When virsh needs sudo, the daemon is the
+	# system one and must get the system qemu — a user-profile path named here
+	# would be unreadable or plain wrong for it — so the element is omitted and
+	# libvirt's own emulator lookup applies.
+	if [ -z "$SUDO" ] && command -v qemu-system-x86_64 >/dev/null; then
 		emulator="    <emulator>$(command -v qemu-system-x86_64)</emulator>"
 	fi
 
